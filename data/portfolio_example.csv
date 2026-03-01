@@ -1,0 +1,4 @@
+instrumentId,idType,instrumentType,shares,targetRatioPct,timestamp
+"TSLA","ticker","Equity",10,55,"2026-02-20"
+"SPY","ticker","Equity",10,55,"2026-02-20"
+"USD","name","Cash and Cash Equivalents",99.67,0,"2026-02-20"

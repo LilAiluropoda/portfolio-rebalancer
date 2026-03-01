@@ -1,0 +1,6 @@
+# package manager
+.venv/
+
+# data
+data/portfolio_*.csv
+!data/portfolio_example.csv
