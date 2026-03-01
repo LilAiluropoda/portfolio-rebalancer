@@ -212,14 +212,13 @@ def printTradeSummary(trades: list[Trade]) -> None:
 def generateTrades(positionEnrichedDF: pl.DataFrame, tradingPlatform: TradingPlatform, tradeTimestamp: datetime) -> list[Trade]:
     """
     Generate trades to rebalance the portfolio.
-
     Strategy:
     1. Use cash first (idType == 'cash') to fund purchases.
-    2. For non-cash positions, compute the integer share delta needed to move
+    2. Two-pass ordering: process sells first to free up cash, then process buys.
+    3. For non-cash positions, compute the integer share delta needed to move
        each position toward its target market value.
-    3. After share-level rounding, reconcile the residual cash impact so the
+    4. After share-level rounding, reconcile the residual cash impact so the
        cash position absorbs whatever is left over.
-
     Returns a list of Trade objects (cash trade last, after netting).
     """
     logger.info(f"[Trade Generation] Trade generation started")
@@ -227,11 +226,16 @@ def generateTrades(positionEnrichedDF: pl.DataFrame, tradingPlatform: TradingPla
     (hasCash, cashAvailable) = getAvailableCash(positionEnrichedDF)
     logger.info(f"[Trade Generation] Available cash before rebalancing: {cashAvailable:.2f}")
 
-    # Assumption: Execution ordered by row sequence
     netCashUsed: float = 0.0
     trades: list[Trade] = []
     nonCashRows = positionEnrichedDF.filter(pl.col("instrumentType") != "Cash and Cash Equivalents")
-    for index, row in enumerate(nonCashRows.iter_rows(named=True), start=1):
+
+    # Two-pass ordering: sells first (currMinusTargetMarketValue > 0) then buys (< 0)
+    sellRows = nonCashRows.filter(pl.col("currMinusTargetMarketValue") > 0)
+    buyRows = nonCashRows.filter(pl.col("currMinusTargetMarketValue") < 0)
+    orderedRows = pl.concat([sellRows, buyRows])
+
+    for index, row in enumerate(orderedRows.iter_rows(named=True), start=1):
         tradeId: int = index
         instrumentId: str = row["instrumentId"]
         instrumentType: str = row["instrumentType"]
@@ -244,8 +248,9 @@ def generateTrades(positionEnrichedDF: pl.DataFrame, tradingPlatform: TradingPla
             continue
 
         requiredSharesChange = -1 * targetDifference / closingPrice  # positive = buy, negative = sell
+
         if requiredSharesChange >= 0:
-            # Buying — constrained by available cash
+            # Buying — constrained by available cash (including cash freed from sells)
             maxSharesBuyable = int((cashAvailable - netCashUsed) / closingPrice)
             sharesChange = min(int(requiredSharesChange), maxSharesBuyable)
         else:
@@ -271,34 +276,35 @@ def generateTrades(positionEnrichedDF: pl.DataFrame, tradingPlatform: TradingPla
             )
         )
         logger.info(f"[Trade Generation] Generated Trade(instrumentId={instrumentId} | Price={closingPrice:.2f} | Share Change={sharesChange:.2f} | Market Value Change={marketValueChange:.2f})")
-    
-    
+
     # Cash movement
     isCashUsed = abs(netCashUsed) > 0.01
     if hasCash and isCashUsed:
         cashMovement = -1 * netCashUsed  # cash decreases when we buy, increases when we sell
         trades.append(
             Trade(
-                tradeId=str(len(nonCashRows)),
+                tradeId=str(len(orderedRows)),
                 instrumentId="USD",
                 instrumentType="Cash and Cash Equivalents",
-                price=1, #Assumption: Cash is in USD
+                price=1,  # Assumption: Cash is in USD
                 sharesChange=cashMovement,
                 marketValueChange=cashMovement,
                 timestamp=tradeTimestamp,
             )
         )
         logger.info(f"[Trade Generation] Cash movement: {cashMovement} (USD).")
+
     logger.info(f"[Trade Generation] Trade(s) generated: {len(trades)}")
 
     # Transaction Cost
     for trade in trades:
         trade.calcTransactionCost(platform=tradingPlatform)
-    
+
     if trades:
         printTradeSummary(trades)
     else:
         logger.info(f"[Trade Generation] No trades generated.")
+
     return trades
 
 def applyTrades(positionEnrichedDF: pl.DataFrame, trades: list[Trade]) -> pl.DataFrame:
