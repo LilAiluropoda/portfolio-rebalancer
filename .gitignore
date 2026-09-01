@@ -7,3 +7,6 @@ data/portfolio_*.csv
 # python tooling
 __pycache__/
 .pytest_cache/
+
+# secrets
+.env
