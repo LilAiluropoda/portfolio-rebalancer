@@ -4,3 +4,6 @@
 # data
 data/portfolio_*.csv
 !data/portfolio_example.csv
+# python tooling
+__pycache__/
+.pytest_cache/
