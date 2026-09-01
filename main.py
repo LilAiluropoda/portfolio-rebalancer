@@ -64,6 +64,10 @@ class TradingPlatform(ABC):
     def calcTransactionCost(self, instrumentType: str, sharesChange: float, marketValueChange: float) -> float:
         pass
 
+    @abstractmethod
+    def calcOptionsTransactionCost(self, instrumentType: str, sharesChange: float, marketValueChange: float) -> float:
+        pass
+
 class FutuBullUS(TradingPlatform):
     def calcTransactionCost(self, instrumentType: str, sharesChange: float, marketValueChange: float) -> float:
         """
@@ -99,6 +103,50 @@ class FutuBullUS(TradingPlatform):
 
         return transactionCost
 
+    def calcOptionsTransactionCost(self, instrumentType: str, sharesChange: float, marketValueChange: float) -> float:
+        """
+        Calculate US option transaction cost based on Futu HK US options fee schedule (USD, per contract).
+        sharesChange carries contract counts; marketValueChange carries premium notional (contracts x premium x 100).
+        One trade row = one order.
+        """
+        contractsGross = abs(sharesChange)
+        marketValueChangeGross = abs(marketValueChange)
+
+        # ---- Commission (premium > $0.1 assumed for LEAPS) ----
+        commissionFee = max(contractsGross * 0.65, 1.99)
+
+        # ---- Platform fee (fixed package) ----
+        platformFee = contractsGross * 0.30
+
+        # ---- Options Regulatory Fee (ORF) ----
+        orfFee = contractsGross * 0.013
+
+        # ---- OCC clearing fee (capped at 55) ----
+        occFee = min(contractsGross * 0.02, 55)
+
+        # ---- Settlement fee ----
+        settlementFee = contractsGross * 0.18
+
+        # ---- Consolidated Audit Trail (CAT) fee ----
+        catFee = contractsGross * 0.0003
+
+        # ---- SEC fee (SELL only) ----
+        secFee = 0.0
+        if sharesChange < 0:
+            secFee = max(marketValueChangeGross * 0.0000206, 0.01)
+
+        # ---- FINRA Trading Activity Fee (SELL only) ----
+        finraActivityFee = 0.0
+        if sharesChange < 0:
+            finraActivityFee = max(contractsGross * 0.00329, 0.01)
+
+        transactionCost = (
+            commissionFee + platformFee + orfFee + occFee
+            + settlementFee + catFee + secFee + finraActivityFee
+        )
+
+        return transactionCost
+
 class TradingPlatformFactory:
     instances: dict[str, TradingPlatform] = {}
     @classmethod
@@ -122,7 +170,10 @@ class Trade(BaseModel):
     timestamp: datetime
 
     def calcTransactionCost(self, platform: TradingPlatform)->None:
-        self.transactionCost = platform.calcTransactionCost(self.instrumentType, self.sharesChange, self.marketValueChange)
+        if self.instrumentType == "LEAPS Call":
+            self.transactionCost = platform.calcOptionsTransactionCost(self.instrumentType, self.sharesChange, self.marketValueChange)
+        else:
+            self.transactionCost = platform.calcTransactionCost(self.instrumentType, self.sharesChange, self.marketValueChange)
 
 def getAvailableCash(positionEnrichedDF: pl.DataFrame) -> tuple[bool, float]:
     cashRows = positionEnrichedDF.filter(pl.col("instrumentType") == "Cash and Cash Equivalents")
