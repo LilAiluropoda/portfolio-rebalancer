@@ -1,15 +1,22 @@
 from pydantic import BaseModel
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import logging
 import math
 import yfinance as yf
 import polars as pl
 import argparse
+import calendar
 
-from options_data import OccParseError, OptionQuoteSource, OptionDataSourceFactory, parseOccSymbol
+from options_data import (
+    OccParseError,
+    OptionQuoteSource,
+    OptionSnapshot,
+    OptionDataSourceFactory,
+    parseOccSymbol,
+)
 
 APP_NAME = "Portfolio Rebalancer"
 logger = logging.Logger(APP_NAME)
@@ -19,6 +26,13 @@ logger.addHandler(logging.StreamHandler())
 OPTION_MULTIPLIER = 100.0
 CASH_TYPE = "Cash and Cash Equivalents"
 OPTION_TYPE = "LEAPS Call"
+
+# Contract lifecycle / selection constants (R9-R13, R21)
+MIN_EXPIRY_MONTHS = 21
+ROLL_MONTHS_THRESHOLD = 12
+TARGET_DELTA = 0.85
+MAX_REL_SPREAD = 0.10
+MIN_DAILY_VOLUME = 1.0
 
 class PriceDataSource(ABC):
     @abstractmethod
@@ -266,6 +280,274 @@ def buildSleeveTable(
         .with_columns((pl.col("currentExposure") - pl.col("targetExposure")).alias("exposureDiff"))
     )
     return sleeveTable
+
+
+def addMonths(d: date, months: int) -> date:
+    """Shift a date by whole months, clamping the day to the target month's length."""
+    total = d.month - 1 + months
+    year = d.year + total // 12
+    month = total % 12 + 1
+    day = min(d.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def monthsBetween(later: date, earlier: date) -> int:
+    """Whole months from `earlier` to `later` (calendar-month difference)."""
+    return later.year * 12 + later.month - (earlier.year * 12 + earlier.month)
+
+
+def _passesLiquidityFilter(snap) -> bool:
+    if snap.mid <= 0:
+        return False
+    relativeSpread = (snap.ask - snap.bid) / snap.mid
+    return relativeSpread <= MAX_REL_SPREAD and snap.volume >= MIN_DAILY_VOLUME
+
+
+def _pickCandidate(candidates) -> OptionSnapshot:
+    """Latest expiry first; within it, the strike whose delta is nearest TARGET_DELTA."""
+    latestExpiry = max(s.expiry for s in candidates)
+    return min(
+        (s for s in candidates if s.expiry == latestExpiry),
+        key=lambda s: abs(s.delta - TARGET_DELTA),
+    )
+
+
+def selectContract(
+    optionSource: OptionQuoteSource, underlying: str, today: date
+) -> tuple[OptionSnapshot | None, str]:
+    """
+    Rule-based contract selection (R12). Returns (snapshot | None, outcome) where
+    outcome is "selected", "deferred" (chain-depth: candidates exist only below
+    MIN_EXPIRY_MONTHS, R21), or "none" (no candidate passes the liquidity filter).
+    """
+    expiryFloor = addMonths(today, MIN_EXPIRY_MONTHS)
+    chain = optionSource.getChain(
+        underlying, expirationDateGte=expiryFloor.isoformat(), optionType="call"
+    )
+    candidates = [s for s in chain.values() if s.expiry >= expiryFloor and _passesLiquidityFilter(s)]
+    if candidates:
+        snap = _pickCandidate(candidates)
+        logger.info(
+            f"[Contract Selection] {underlying}: selected {snap.symbol} "
+            f"(expiry {snap.expiry}, delta {snap.delta:.4f}, mid {snap.mid:.2f})"
+        )
+        return snap, "selected"
+
+    # Chain-depth probe: would candidates exist without the MIN_EXPIRY_MONTHS floor?
+    probeFloor = addMonths(today, ROLL_MONTHS_THRESHOLD)
+    probeChain = optionSource.getChain(
+        underlying, expirationDateGte=probeFloor.isoformat(), optionType="call"
+    )
+    if any(s.expiry >= probeFloor and _passesLiquidityFilter(s) for s in probeChain.values()):
+        logger.info(
+            f"[Contract Selection] {underlying}: candidates exist only below "
+            f"{MIN_EXPIRY_MONTHS} months — deferring"
+        )
+        return None, "deferred"
+
+    logger.info(f"[Contract Selection] {underlying}: no qualifying candidate")
+    return None, "none"
+
+
+def _bestEffortInt(shareDelta: float, heldShares: float) -> int:
+    """Truncate toward zero; never sell more shares than held."""
+    shareChange = int(shareDelta)  # truncates toward zero
+    return max(shareChange, -int(heldShares))
+
+
+def planTrades(
+    positionEnrichedDF: pl.DataFrame,
+    sleeveTable: pl.DataFrame,
+    designatedUnderlying: str | None,
+    leverage: float,
+    optionSource: OptionQuoteSource,
+    tradeTimestamp: datetime,
+) -> list[Trade]:
+    """
+    Sleeve planner: walk the sleeve table and emit per-sleeve order intents
+    (contract trades + share trades, each with a reason, R14). Lifecycle per
+    R9-R13 and R17: keep/resize, roll, initiate, liquidate; shares fallback
+    when no qualifying contract exists. Trade IDs are sequential from 1;
+    the executor (U8) owns waterfall ordering and fees.
+    """
+    today = tradeTimestamp.date() if isinstance(tradeTimestamp, datetime) else tradeTimestamp
+    totalMarketValue = positionEnrichedDF["marketValue"].sum()
+
+    spotByUnderlying = {
+        row["underlying"]: row["underlyingSpot"]
+        for row in positionEnrichedDF.filter(pl.col("kind") != "cash").iter_rows(named=True)
+    }
+    optionRowsByUnderlying: dict[str, list[dict]] = {}
+    for row in positionEnrichedDF.filter(pl.col("kind") == "option").iter_rows(named=True):
+        optionRowsByUnderlying.setdefault(row["underlying"], []).append(row)
+
+    trades: list[Trade] = []
+
+    def emitContract(
+        underlying: str, symbol: str, contractChange: int, premiumMid: float,
+        perContractExposure: float, spot: float, reason: str,
+    ) -> None:
+        trades.append(
+            Trade(
+                tradeId=str(len(trades) + 1),
+                instrumentId=symbol,
+                instrumentType=OPTION_TYPE,
+                price=premiumMid,
+                sharesChange=float(contractChange),
+                marketValueChange=contractChange * premiumMid * OPTION_MULTIPLIER,
+                timestamp=tradeTimestamp,
+                underlying=underlying,
+                quantityKind="contract",
+                exposureChange=contractChange * perContractExposure,
+                reason=reason,
+            )
+        )
+
+    def emitShares(underlying: str, shareChange: int, spot: float, reason: str) -> None:
+        trades.append(
+            Trade(
+                tradeId=str(len(trades) + 1),
+                instrumentId=underlying,
+                instrumentType="Equity",
+                price=spot,
+                sharesChange=float(shareChange),
+                marketValueChange=shareChange * spot,
+                timestamp=tradeTimestamp,
+                underlying=underlying,
+                quantityKind="share",
+                exposureChange=shareChange * spot,
+                reason=reason,
+            )
+        )
+
+    def emitResize(
+        sleeve: dict, heldPerContractExposure: float, heldContracts: float,
+        heldShares: float, spot: float, anchorRow: dict,
+        contractReason: str, shareReason: str,
+    ) -> None:
+        plan = sizeSleeve(
+            sleeve["targetExposure"], heldPerContractExposure, heldContracts, heldShares, spot
+        )
+        if plan.contractChange != 0:
+            emitContract(
+                sleeve["underlying"], anchorRow["instrumentId"], plan.contractChange,
+                anchorRow["closingPrice"], heldPerContractExposure, spot, contractReason,
+            )
+        if plan.shareChange != 0:
+            emitShares(sleeve["underlying"], int(plan.shareChange), spot, shareReason)
+
+    for sleeve in sleeveTable.iter_rows(named=True):
+        underlying = sleeve["underlying"]
+        spot = spotByUnderlying[underlying]
+        heldShares = sleeve["heldShares"]
+        heldContracts = sleeve["heldContracts"]
+        heldOptionRows = optionRowsByUnderlying.get(underlying, [])
+        baseWeightExposure = sleeve["weight"] * totalMarketValue
+        equityExposure = heldShares * spot
+
+        if not sleeve["isDesignated"]:
+            if heldContracts > 0:
+                # R17: stray / option-only sleeve — liquidate all held contracts
+                for row in heldOptionRows:
+                    emitContract(
+                        underlying, row["instrumentId"], -row["shares"], row["closingPrice"],
+                        OPTION_MULTIPLIER * row["deltaAdj"] * spot, spot,
+                        "liquidation: non-designated sleeve",
+                    )
+                shareChange = _bestEffortInt(
+                    (sleeve["targetExposure"] - equityExposure) / spot, heldShares
+                )
+                if shareChange != 0:
+                    emitShares(underlying, shareChange, spot, "drift rebalance")
+            else:
+                # Plain equity sleeve — share drift rebalance only
+                shareChange = _bestEffortInt(
+                    (sleeve["targetExposure"] - sleeve["currentExposure"]) / spot, heldShares
+                )
+                if shareChange != 0:
+                    emitShares(underlying, shareChange, spot, "drift rebalance")
+            continue
+
+        # --- Designated sleeve lifecycle ---
+        if heldContracts == 0:
+            # R11: initiate
+            snap, outcome = selectContract(optionSource, underlying, today)
+            if outcome == "selected":
+                perContract = OPTION_MULTIPLIER * snap.delta * spot
+                plan = sizeSleeve(sleeve["targetExposure"], perContract, 0, heldShares, spot)
+                if plan.contractChange != 0:
+                    emitContract(
+                        underlying, snap.symbol, plan.contractChange, snap.mid,
+                        perContract, spot, "initiation",
+                    )
+                if plan.shareChange != 0:
+                    emitShares(underlying, int(plan.shareChange), spot, "initiation share residual")
+            else:
+                # R13: shares fallback at base weight
+                shareChange = _bestEffortInt((baseWeightExposure - equityExposure) / spot, heldShares)
+                if shareChange != 0:
+                    emitShares(
+                        underlying, shareChange, spot, "shares fallback: no qualifying contract"
+                    )
+            continue
+
+        earliestRow = min(
+            heldOptionRows, key=lambda r: parseOccSymbol(r["instrumentId"]).expiry
+        )
+        monthsToExpiry = monthsBetween(parseOccSymbol(earliestRow["instrumentId"]).expiry, today)
+        heldOptionExposure = sum(
+            row["shares"] * OPTION_MULTIPLIER * row["deltaAdj"] * spot for row in heldOptionRows
+        )
+        heldPerContract = heldOptionExposure / heldContracts
+
+        if monthsToExpiry > ROLL_MONTHS_THRESHOLD:
+            # R9: keep — resize quantity only, no selection call
+            emitResize(
+                sleeve, heldPerContract, heldContracts, heldShares, spot, earliestRow,
+                "resize", "drift rebalance",
+            )
+            continue
+
+        # R10: roll window
+        snap, outcome = selectContract(optionSource, underlying, today)
+        if outcome == "selected":
+            for row in heldOptionRows:
+                emitContract(
+                    underlying, row["instrumentId"], -row["shares"], row["closingPrice"],
+                    OPTION_MULTIPLIER * row["deltaAdj"] * spot, spot, "roll: exit",
+                )
+            perContract = OPTION_MULTIPLIER * snap.delta * spot
+            plan = sizeSleeve(sleeve["targetExposure"], perContract, 0, heldShares, spot)
+            if plan.contractChange != 0:
+                emitContract(
+                    underlying, snap.symbol, plan.contractChange, snap.mid,
+                    perContract, spot, "roll: replacement",
+                )
+            if plan.shareChange != 0:
+                emitShares(underlying, int(plan.shareChange), spot, "roll: share residual")
+        elif outcome == "deferred":
+            # R21: chain-depth deferral — keep the held contract, resize toward target
+            logger.info(
+                f"[Planner] {underlying}: roll deferred — chain depth "
+                f"(no qualifying expiry >= {MIN_EXPIRY_MONTHS} months)"
+            )
+            emitResize(
+                sleeve, heldPerContract, heldContracts, heldShares, spot, earliestRow,
+                "roll deferred — chain depth", "roll deferred — chain depth",
+            )
+        else:
+            # R13: sell held, de-lever to base weight in shares
+            for row in heldOptionRows:
+                emitContract(
+                    underlying, row["instrumentId"], -row["shares"], row["closingPrice"],
+                    OPTION_MULTIPLIER * row["deltaAdj"] * spot, spot,
+                    "roll: exit — no qualifying replacement",
+                )
+            shareChange = _bestEffortInt((baseWeightExposure - equityExposure) / spot, heldShares)
+            if shareChange != 0:
+                emitShares(underlying, shareChange, spot, "shares fallback: roll de-lever")
+
+    return trades
 
 
 def normalizePositions(positionDF: pl.DataFrame) -> pl.DataFrame:
