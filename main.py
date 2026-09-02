@@ -1,8 +1,10 @@
 from pydantic import BaseModel
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 import logging
+import math
 import yfinance as yf
 import polars as pl
 import argparse
@@ -163,12 +165,108 @@ class Trade(BaseModel):
     marketValueChange: float
     transactionCost: float = 0
     timestamp: datetime
+    underlying: str = ""
+    quantityKind: str = "share"  # "share" | "contract" | "cash"
+    exposureChange: float = 0.0
+    reason: str = ""
 
     def calcTransactionCost(self, platform: TradingPlatform)->None:
         if self.instrumentType == "LEAPS Call":
             self.transactionCost = platform.calcOptionsTransactionCost(self.instrumentType, self.sharesChange, self.marketValueChange)
         else:
             self.transactionCost = platform.calcTransactionCost(self.instrumentType, self.sharesChange, self.marketValueChange)
+
+@dataclass
+class SleevePlan:
+    contractChange: int
+    shareChange: float
+    trackingErrorExposure: float
+    achievedExposure: float
+    residualDirection: str  # "overshoot" | "undershoot" | "on-target"
+
+
+def sizeSleeve(
+    targetExposure: float,
+    perContractExposure: float,
+    heldContracts: float,
+    heldShares: float,
+    spot: float,
+) -> SleevePlan:
+    """
+    Size a sleeve's delivery: contracts round to nearest (half-up); the signed
+    share residual absorbs the difference, clamped so the sleeve never sells
+    more shares than it holds; whatever survives integer share rounding is
+    tracking error.
+    """
+    if targetExposure < 0:
+        raise ValueError(f"Sleeve target exposure must be >= 0, got {targetExposure}")
+
+    desiredContracts = int(math.floor(targetExposure / perContractExposure + 0.5))
+    contractChange = desiredContracts - int(heldContracts)
+
+    residualExposure = targetExposure - desiredContracts * perContractExposure
+    desiredShareChange = residualExposure / spot
+    shareChange = math.floor(desiredShareChange) if desiredShareChange >= 0 else math.ceil(desiredShareChange)
+    shareChange = max(shareChange, -int(heldShares))  # never sell more than held
+
+    achievedExposure = desiredContracts * perContractExposure + shareChange * spot
+    # Signed tracking error: positive = overshoot, negative = undershoot
+    trackingErrorExposure = achievedExposure - targetExposure
+    if trackingErrorExposure > 1e-9:
+        residualDirection = "undershoot"
+    elif trackingErrorExposure < -1e-9:
+        residualDirection = "overshoot"
+    else:
+        residualDirection = "on-target"
+
+    return SleevePlan(
+        contractChange=contractChange,
+        shareChange=float(shareChange),
+        trackingErrorExposure=trackingErrorExposure,
+        achievedExposure=achievedExposure,
+        residualDirection=residualDirection,
+    )
+
+
+def buildSleeveTable(
+    positionEnrichedDF: pl.DataFrame, leverage: float, designatedUnderlying: str | None
+) -> pl.DataFrame:
+    """
+    Group the enriched frame by underlying into a sleeve table:
+      - currentExposure: sum of delta-adjusted exposure across share + contract rows
+      - targetExposure: weight x MV for normal sleeves;
+        (weight + L - 1) x MV for the designated sleeve;
+        0 for non-designated option-only sleeves (liquidation target)
+    """
+    totalMarketValue = positionEnrichedDF["marketValue"].sum()
+
+    weightByUnderlying = {
+        row["underlying"]: row["targetRatioPct"] / 100.0
+        for row in positionEnrichedDF.filter(pl.col("kind") == "equity").iter_rows(named=True)
+    }
+
+    sleeveTable = (
+        positionEnrichedDF.filter(pl.col("kind") != "cash")
+        .group_by("underlying")
+        .agg(
+            pl.col("exposure").sum().alias("currentExposure"),
+            pl.when(pl.col("kind") == "option").then(pl.col("shares")).otherwise(0.0).sum().alias("heldContracts"),
+            pl.when(pl.col("kind") == "equity").then(pl.col("shares")).otherwise(0.0).sum().alias("heldShares"),
+        )
+        .with_columns(
+            (pl.col("underlying") == (designatedUnderlying or "")).alias("isDesignated"),
+            pl.col("underlying").replace_strict(weightByUnderlying, default=0.0).alias("weight"),
+        )
+        .with_columns(
+            pl.when(pl.col("isDesignated"))
+            .then((pl.col("weight") + leverage - 1.0) * totalMarketValue)
+            .otherwise(pl.col("weight") * totalMarketValue)
+            .alias("targetExposure"),
+        )
+        .with_columns((pl.col("currentExposure") - pl.col("targetExposure")).alias("exposureDiff"))
+    )
+    return sleeveTable
+
 
 def normalizePositions(positionDF: pl.DataFrame) -> pl.DataFrame:
     """
