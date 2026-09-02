@@ -1,0 +1,9 @@
+instrumentId,idType,instrumentType,shares,targetRatioPct,timestamp,leapsSleeve
+"VOO","ticker","Equity",35,55,"2026-08-04","true"
+"URA","ticker","Equity",267,25,"2026-08-04",
+"MCHI","ticker","Equity",41,5,"2026-08-04",
+"MS","ticker","Equity",11,5,"2026-08-04",
+"GS","ticker","Equity",2,5,"2026-08-04",
+"BABA","ticker","Equity",18,5,"2026-08-04",
+"VOO270115C00450000","occ","LEAPS Call",2,,"2026-08-04",
+"USD","name","Cash and Cash Equivalents",29371,0,"2026-08-04",

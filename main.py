@@ -7,21 +7,16 @@ import yfinance as yf
 import polars as pl
 import argparse
 
+from options_data import OccParseError, OptionQuoteSource, OptionDataSourceFactory, parseOccSymbol
+
 APP_NAME = "Portfolio Rebalancer"
 logger = logging.Logger(APP_NAME)
 logger.setLevel(logging.DEBUG)
 logger.addHandler(logging.StreamHandler())
 
-
-positionSchema = {
-    "instrumentId": pl.String,
-    "idType": pl.String,
-    "instrumentType": pl.String,
-    "marketValue": pl.Float64,
-    "shares": pl.Float64,
-    "targetRatioPct": pl.Float64,
-    "timestamp": pl.Date,
-}
+OPTION_MULTIPLIER = 100.0
+CASH_TYPE = "Cash and Cash Equivalents"
+OPTION_TYPE = "LEAPS Call"
 
 class PriceDataSource(ABC):
     @abstractmethod
@@ -175,45 +170,187 @@ class Trade(BaseModel):
         else:
             self.transactionCost = platform.calcTransactionCost(self.instrumentType, self.sharesChange, self.marketValueChange)
 
+def normalizePositions(positionDF: pl.DataFrame) -> pl.DataFrame:
+    """
+    Normalize the loaded CSV into the unified positions frame:
+    every row (equity, cash, LEAPS option) carries kind, underlying,
+    multiplier, and deltaAdj so valuation and exposure math are uniform.
+    """
+    if "leapsSleeve" not in positionDF.columns:
+        positionDF = positionDF.with_columns(pl.lit(None, dtype=pl.String).alias("leapsSleeve"))
+
+    positionDF = positionDF.with_columns(
+        pl.when(pl.col("instrumentType") == CASH_TYPE)
+        .then(pl.lit("cash"))
+        .when(pl.col("instrumentType") == OPTION_TYPE)
+        .then(pl.lit("option"))
+        .otherwise(pl.lit("equity"))
+        .alias("kind")
+    )
+
+    optionRows = positionDF.filter(pl.col("kind") == "option")
+    rootBySymbol = {
+        row["instrumentId"]: parseOccSymbol(row["instrumentId"]).underlying
+        for row in optionRows.iter_rows(named=True)
+    }
+
+    positionDF = positionDF.with_columns(
+        pl.when(pl.col("kind") == "option")
+        .then(pl.col("instrumentId").replace_strict(rootBySymbol, default=None))
+        .otherwise(pl.col("instrumentId"))
+        .alias("underlying"),
+        pl.when(pl.col("kind") == "option")
+        .then(pl.lit(OPTION_MULTIPLIER))
+        .otherwise(pl.lit(1.0))
+        .alias("multiplier"),
+        pl.when(pl.col("kind") == "cash").then(pl.lit(0.0)).otherwise(pl.lit(1.0)).alias("deltaAdj"),
+        pl.col("leapsSleeve")
+        .cast(pl.String)
+        .fill_null("")
+        .str.to_lowercase()
+        .is_in(["true", "1", "yes"])
+        .alias("leapsSleeve"),
+    )
+    return positionDF
+
+
+def validateInputs(positionDF: pl.DataFrame, leverage: float, liquidateLeaps: bool) -> str | None:
+    """
+    Validate the normalized frame and CLI inputs. Returns the designated
+    LEAPS sleeve underlying (or None). Raises on invalid input.
+    """
+    if leverage < 1.0:
+        raise ValueError(f"--leverage must be >= 1.0, got {leverage}")
+
+    designatedUnderlyings = (
+        positionDF.filter(pl.col("leapsSleeve")).select(pl.col("underlying")).unique().to_series().to_list()
+    )
+    if len(designatedUnderlyings) > 1:
+        raise ValueError(
+            f"At most one LEAPS sleeve underlying may be designated, got {designatedUnderlyings}"
+        )
+    designated = designatedUnderlyings[0] if designatedUnderlyings else None
+
+    hasOptions = positionDF.filter(pl.col("kind") == "option").height > 0
+    if hasOptions and (designated is None or leverage == 1.0) and not liquidateLeaps:
+        raise ValueError(
+            "Held LEAPS positions present but no sleeve is designated (or --leverage is at "
+            "the 1.0 default) — proceeding would liquidate the LEAPS sleeve. Pass "
+            "--liquidate-leaps to do that deliberately, or set the leapsSleeve marker and --leverage."
+        )
+
+    equityTotalPct = positionDF.filter(pl.col("kind") == "equity").select(pl.col("targetRatioPct").sum()).item()
+    if equityTotalPct != 100:
+        raise ValueError(
+            f"Equity targetRatioPct did not add up to 100 (Actual: {equityTotalPct}), "
+            "please check if csv input is correct"
+        )
+
+    return designated
+
+
 def getAvailableCash(positionEnrichedDF: pl.DataFrame) -> tuple[bool, float]:
-    cashRows = positionEnrichedDF.filter(pl.col("instrumentType") == "Cash and Cash Equivalents")
+    cashRows = positionEnrichedDF.filter(pl.col("instrumentType") == CASH_TYPE)
     cashAvailable: float = (
         cashRows.select(pl.col("marketValue").sum()).item() if len(cashRows) > 0 else 0.0
     )
     hasCash = len(cashRows) > 0
     return hasCash, cashAvailable
 
-def enrichPositions(positionDF: pl.DataFrame, priceDataSource: PriceDataSource):
+def enrichPositions(
+    positionDF: pl.DataFrame,
+    priceDataSource: PriceDataSource,
+    optionSource: OptionQuoteSource | None = None,
+) -> pl.DataFrame:
+    """
+    Value every row by kind and derive the uniform exposure columns:
+      - equity / cash: closing price via the equity source at the CSV timestamp
+      - option: mid premium and delta via the option snapshot source at run time
+    marketValue = shares x closingPrice x multiplier (cash impact)
+    exposure    = shares x multiplier x deltaAdj x underlyingSpot (delta-adjusted dollars)
+    Option valuation failure aborts here — before any trade generation.
+    """
     logger.info(f"[Position Enrichment] Position enrichment started")
-    positionEnrichedDF = positionDF.with_columns(
-        (
-            pl.struct(["instrumentId", "timestamp", "idType"])
-            .map_elements(
-                lambda row: priceDataSource.getClosingPrice(
-                    ticker=row["instrumentId"],
-                    date=datetime.strptime(row["timestamp"], "%Y-%m-%d"),
-                ),
-                return_dtype=pl.Float64,
+
+    positionDF = positionDF.with_row_index("rowIdx")
+
+    equityCashRows = positionDF.filter(pl.col("kind") != "option").with_columns(
+        pl.struct(["instrumentId", "timestamp", "kind"])
+        .map_elements(
+            lambda row: priceDataSource.getClosingPrice(
+                ticker=row["instrumentId"],
+                date=datetime.strptime(row["timestamp"], "%Y-%m-%d"),
+            ),
+            return_dtype=pl.Float64,
+        )
+        .alias("closingPrice"),
+    )
+
+    optionRows = positionDF.filter(pl.col("kind") == "option")
+    if optionRows.height > 0:
+        if optionSource is None:
+            raise Exception("Option rows present but no option data source was provided")
+        symbols = optionRows["instrumentId"].to_list()
+        snapshots = optionSource.getSnapshots(symbols)
+        missingSymbols = [s for s in symbols if s not in snapshots]
+        if missingSymbols:
+            raise ValueError(
+                f"No option snapshot available for {missingSymbols} — aborting before trade generation"
             )
-            .alias("closingPrice")
-        ),
+        optionRows = optionRows.with_columns(
+            pl.col("instrumentId")
+            .replace_strict({s: snap.mid for s, snap in snapshots.items()}, default=None)
+            .alias("closingPrice"),
+            pl.col("instrumentId")
+            .replace_strict({s: snap.delta for s, snap in snapshots.items()}, default=None)
+            .alias("deltaAdj"),
+        )
+    else:
+        optionRows = optionRows.with_columns(
+            pl.lit(None, dtype=pl.Float64).alias("closingPrice")
+        )
+
+    positionEnrichedDF = (
+        pl.concat([equityCashRows, optionRows], how="vertical")
+        .sort("rowIdx")
+        .drop("rowIdx")
     )
 
     positionEnrichedDF = positionEnrichedDF.with_columns(
-        ((pl.col("shares") * pl.col("closingPrice")).alias("marketValue")),
+        ((pl.col("shares") * pl.col("closingPrice") * pl.col("multiplier")).alias("marketValue")),
     )
     logger.info(f"[Position Enrichment] Added columns: closingPrice, marketValue")
-    
-    overallStats: pl.DataFrame = positionEnrichedDF.sum()
-    totalPct = overallStats.select(pl.col("targetRatioPct")).item()
-    if totalPct != 100:
-        raise Exception(
-            f"targetRatioPct did not add up to 100 (Actual: {totalPct}), "
-            "please check if csv input is correct"
-        )
-    totalMarketValue = overallStats.select(pl.col("marketValue")).item()
+
+    totalMarketValue = positionEnrichedDF["marketValue"].sum()
     logger.info(f"[Position Enrichment] Total market value: {totalMarketValue}")
-    
+
+    # Underlying spots for exposure: equity rows price themselves; option rows
+    # price their underlying. Option-only sleeves fetch the spot via the equity
+    # source at the CSV timestamp (single fetch, cached).
+    spotByUnderlying = {
+        row["underlying"]: row["closingPrice"]
+        for row in positionEnrichedDF.filter(pl.col("kind") != "option").iter_rows(named=True)
+    }
+    for optionRow in positionEnrichedDF.filter(pl.col("kind") == "option").iter_rows(named=True):
+        underlying = optionRow["underlying"]
+        if underlying not in spotByUnderlying:
+            spotByUnderlying[underlying] = priceDataSource.getClosingPrice(
+                ticker=underlying,
+                date=datetime.strptime(optionRow["timestamp"], "%Y-%m-%d"),
+            )
+
+    positionEnrichedDF = positionEnrichedDF.with_columns(
+        pl.col("underlying").replace_strict(spotByUnderlying, default=None).alias("underlyingSpot"),
+    )
+
+    positionEnrichedDF = positionEnrichedDF.with_columns(
+        ((pl.col("shares") * pl.col("multiplier") * pl.col("deltaAdj")).alias("deltaShares")),
+    )
+    positionEnrichedDF = positionEnrichedDF.with_columns(
+        ((pl.col("deltaShares") * pl.col("underlyingSpot")).alias("exposure")),
+    )
+    logger.info(f"[Position Enrichment] Added columns: underlyingSpot, deltaShares, exposure")
+
     positionEnrichedDF = positionEnrichedDF.with_columns(
         ((pl.col("marketValue") / totalMarketValue * 100).alias("currentRatio")),
         ((pl.col("targetRatioPct") / 100 * totalMarketValue).alias("targetMarketValue")),
@@ -228,11 +365,13 @@ def enrichPositions(positionDF: pl.DataFrame, priceDataSource: PriceDataSource):
     )
     logger.info(f"[Position Enrichment] Added columns: currentRatio, targetMarketValue, currMinusTargetMarketValue")
 
-    enrichmentSummary: pl.DataFrame = positionEnrichedDF.select(["instrumentId", "shares", "marketValue", "targetRatioPct", "targetMarketValue"])
+    enrichmentSummary: pl.DataFrame = positionEnrichedDF.select(
+        ["instrumentId", "kind", "shares", "marketValue", "exposure", "targetRatioPct", "targetMarketValue"]
+    )
     logger.info(f"[Position Enrichment] Enriched Positions:")
     enrichmentSummary.sort("marketValue", descending=True).show(
-        limit=None, 
-        tbl_hide_dataframe_shape=True, 
+        limit=None,
+        tbl_hide_dataframe_shape=True,
         tbl_column_data_type_inline=True,
         float_precision=2,
     )
@@ -459,12 +598,24 @@ def printEnrichedPostTradePositions(positionPostTradeDF: pl.DataFrame) -> None:
 def main():
     parser = argparse.ArgumentParser(description="Portfolio Rebalancer")
     parser.add_argument(
-        "--portfolioCSV", 
-        type=str, 
-        required=True, 
+        "--portfolioCSV",
+        type=str,
+        required=True,
         help="Path to the CSV file containing portfolio data"
     )
-    
+    parser.add_argument(
+        "--leverage",
+        type=float,
+        default=1.0,
+        help="Portfolio-level leverage target L (total equity exposure = L x portfolio market value)"
+    )
+    parser.add_argument(
+        "--liquidate-leaps",
+        dest="liquidateLeaps",
+        action="store_true",
+        help="Deliberately proceed when held LEAPS would otherwise be liquidated (no sleeve marker, or L at the 1.0 default)"
+    )
+
     args = parser.parse_args()
 
     FILEPATH = Path(args.portfolioCSV)
@@ -472,15 +623,23 @@ def main():
     TRADING_PLATFORM = "futubullUS"
 
     positionDF = pl.read_csv(FILEPATH)
+    positionDF = normalizePositions(positionDF)
+    designatedUnderlying = validateInputs(positionDF, args.leverage, args.liquidateLeaps)
+    logger.info(f"[Data Loading] Loaded CSV with {len(positionDF)} records")
+    logger.info(f"[Data Loading] Leverage target: {args.leverage} | Designated LEAPS sleeve: {designatedUnderlying or 'none'}")
 
     securityNames = positionDF.select(pl.col("instrumentId")).to_series().to_list()
-    logger.info(f"[Data Loading] Loaded CSV with {len(positionDF)} records")
     logger.info(f"[Data Loading] Names: {securityNames}")
 
-    # Value the positions
+    # Value the positions — the option source is only constructed when option rows exist,
+    # so legacy runs need no Alpaca credentials or network access.
     priceDataSource: PriceDataSource = DataSourceFactory.getDataSource(name=DATASOURCE)
     logger.info(f"[Data Loading] Data source selected: {DATASOURCE}")
-    positionEnrichedDF = enrichPositions(positionDF, priceDataSource)
+    optionSource = None
+    if positionDF.filter(pl.col("kind") == "option").height > 0:
+        optionSource = OptionDataSourceFactory.getDataSource("alpaca")
+        logger.info(f"[Data Loading] Option data source selected: alpaca")
+    positionEnrichedDF = enrichPositions(positionDF, priceDataSource, optionSource)
 
     tradeTimestamp = datetime.now()
     tradingPlatform: TradingPlatform = TradingPlatformFactory.getTradingPlatform(TRADING_PLATFORM)
