@@ -213,9 +213,9 @@ def sizeSleeve(
     # Signed tracking error: positive = overshoot, negative = undershoot
     trackingErrorExposure = achievedExposure - targetExposure
     if trackingErrorExposure > 1e-9:
-        residualDirection = "undershoot"
-    elif trackingErrorExposure < -1e-9:
         residualDirection = "overshoot"
+    elif trackingErrorExposure < -1e-9:
+        residualDirection = "undershoot"
     else:
         residualDirection = "on-target"
 
