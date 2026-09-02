@@ -1,0 +1,395 @@
+from datetime import date, datetime
+
+import polars as pl
+import pytest
+
+from main import (
+    CASH_TYPE,
+    OPTION_TYPE,
+    PriceDataSource,
+    TradingPlatformFactory,
+    applyTrades,
+    buildExposureReport,
+    buildSleeveTable,
+    enrichPositions,
+    executeTrades,
+    normalizePositions,
+    planTrades,
+    printExposureReport,
+    validateInputs,
+    Trade,
+)
+from options_data import OptionQuoteSource, OptionSnapshot
+
+TIMESTAMP = "2026-08-04"
+TODAY = datetime(2026, 9, 2, 10, 0, 0)
+SPOT = 700.0
+HELD_ROLL_EXPIRY = date(2027, 6, 18)   # 9 months out -> roll window
+HELD_KEEP_EXPIRY = date(2028, 5, 18)   # 20 months out -> keep
+CHAIN_LATE_EXPIRY = date(2028, 6, 19)  # >= MIN_EXPIRY_MONTHS
+
+
+def occ(root: str, expiry: date, strike: float) -> str:
+    return f"{root}{expiry:%y%m%d}C{int(strike * 1000):08d}"
+
+
+class FakePriceSource(PriceDataSource):
+    def __init__(self, prices):
+        self.prices = prices
+
+    def getClosingPrice(self, ticker, date):
+        return self.prices[ticker]
+
+
+class FakeOptionSource(OptionQuoteSource):
+    def __init__(self, snapshots=None, chainSnapshots=None):
+        self.snapshots = snapshots or {}
+        self.chainSnapshots = chainSnapshots or []
+        self.chainCalls = []
+
+    def getSnapshots(self, symbols):
+        return {s: self.snapshots[s] for s in symbols}
+
+    def getChain(self, underlying, expirationDateGte=None, strikePriceGte=None,
+                 strikePriceLte=None, optionType="call"):
+        self.chainCalls.append(expirationDateGte)
+        return {s.symbol: s for s in self.chainSnapshots}
+
+
+def makeSnapshot(symbol, underlying, mid, delta, expiry, volume=10.0, spread=0.8):
+    return OptionSnapshot(
+        symbol=symbol,
+        underlying=underlying,
+        expiry=expiry,
+        strike=450.0,
+        right="C",
+        bid=mid - spread,
+        ask=mid + spread,
+        mid=mid,
+        delta=delta,
+        iv=0.21,
+        quoteTimestamp=datetime(2026, 9, 2, 16, 0, 0),
+        volume=volume,
+    )
+
+
+def equity(ticker, shares, weight, sleeve=None):
+    return {
+        "instrumentId": ticker,
+        "idType": "ticker",
+        "instrumentType": "Equity",
+        "shares": shares,
+        "targetRatioPct": weight,
+        "timestamp": TIMESTAMP,
+        "leapsSleeve": sleeve,
+    }
+
+
+def option(symbol, contracts, sleeve=None):
+    return {
+        "instrumentId": symbol,
+        "idType": "occ",
+        "instrumentType": "LEAPS Call",
+        "shares": contracts,
+        "targetRatioPct": None,
+        "timestamp": TIMESTAMP,
+        "leapsSleeve": sleeve,
+    }
+
+
+def cash(amount):
+    return {
+        "instrumentId": "USD",
+        "idType": "name",
+        "instrumentType": "Cash and Cash Equivalents",
+        "shares": amount,
+        "targetRatioPct": 0,
+        "timestamp": TIMESTAMP,
+        "leapsSleeve": None,
+    }
+
+
+def frameWith(rows, leverage=1.5):
+    frame = pl.DataFrame(
+        rows,
+        schema={
+            "instrumentId": pl.String,
+            "idType": pl.String,
+            "instrumentType": pl.String,
+            "shares": pl.Float64,
+            "targetRatioPct": pl.Float64,
+            "timestamp": pl.String,
+            "leapsSleeve": pl.String,
+        },
+    )
+    frame = normalizePositions(frame)
+    validateInputs(frame, leverage=leverage, liquidateLeaps=True)
+    return frame
+
+
+def runPipeline(rows, optionSource, leverage=1.5, designated="VOO", prices=None):
+    priceSource = FakePriceSource(prices or {"VOO": SPOT, "URA": 30.0, "USD": 1.0})
+    frame = frameWith(rows, leverage=leverage)
+    enriched = enrichPositions(frame, priceSource, optionSource)
+    sleeveTable = buildSleeveTable(enriched, leverage, designated)
+    planned = planTrades(enriched, sleeveTable, designated, leverage, optionSource, TODAY)
+    platform = TradingPlatformFactory.getTradingPlatform("futubullUS")
+    trades = executeTrades(planned, enriched, platform)
+    return enriched, sleeveTable, trades
+
+
+def tradesBySymbol(trades):
+    return {t.instrumentId: t for t in trades}
+
+
+# --- (a) mixed frame end-to-end (AE2 initiation arithmetic) ---
+
+
+def test_mixed_end_to_end_fees_cash_and_leverage():
+    candidate = makeSnapshot(occ("VOO", CHAIN_LATE_EXPIRY, 420.0), "VOO", 24.22, 0.85, CHAIN_LATE_EXPIRY)
+    source = FakeOptionSource(chainSnapshots=[candidate])
+
+    enriched, sleeveTable, trades = runPipeline(
+        [
+            equity("VOO", 50, 55, sleeve="true"),
+            equity("URA", 2133, 45),
+            cash(1000),
+        ],
+        source,
+    )
+
+    bySymbol = tradesBySymbol(trades)
+    contractBuy = bySymbol[candidate.symbol]
+    assert contractBuy.sharesChange == 2  # AE2: 2 contracts = 119k exposure
+    assert contractBuy.quantityKind == "contract"
+    assert contractBuy.reason == "initiation"
+    assert bySymbol["VOO"].sharesChange == -20  # share residual absorbs -14010.5
+    assert bySymbol["VOO"].reason == "initiation share residual"
+    assert bySymbol["URA"].sharesChange == -633  # drift rebalance to 45% of 99,990
+
+    # Per-row fee minimums: 2-contract option order hits the 1.99 commission floor
+    assert contractBuy.transactionCost == pytest.approx(
+        1.99 + 2 * 0.30 + 2 * 0.013 + 2 * 0.02 + 2 * 0.18 + 2 * 0.0003
+    )
+    # Equity sell fees: per-row minimums (0.99 commission floor, 1.00 platform floor)
+    assert bySymbol["VOO"].transactionCost == pytest.approx(0.99 + 1.00 + 20 * 0.003 + 0.01)
+
+    # Cash row = -(net premium + share flows) - fees, exactly
+    totalFees = sum(t.transactionCost for t in trades[:-1])
+    netFlow = sum(t.marketValueChange for t in trades[:-1])
+    cashRow = trades[-1]
+    assert cashRow.instrumentId == "USD"
+    assert cashRow.instrumentType == CASH_TYPE
+    assert cashRow.quantityKind == "cash"
+    assert cashRow.marketValueChange == pytest.approx(-netFlow - totalFees)
+
+    # R19: achieved leverage = Σ achieved exposure / pre-trade MV
+    report, achievedLeverage, reportFees = buildExposureReport(enriched, sleeveTable, trades)
+    assert achievedLeverage == pytest.approx((140000 + 45000) / 99990)
+    assert reportFees == pytest.approx(totalFees)
+
+    voo = {r["underlying"]: r for r in report.iter_rows(named=True)}["VOO"]
+    assert voo["postShares"] == 30
+    assert voo["postContracts"] == 2
+    assert voo["achievedExposure"] == pytest.approx(140000)
+    assert voo["trackingError"] == pytest.approx(140000 - 104989.5)
+    assert voo["isDesignated"]
+
+
+# --- (b) AE1 / AE3 at pipeline level ---
+
+
+def test_roll_pipeline_paired_rows_with_fee_minimums():
+    held = occ("VOO", HELD_ROLL_EXPIRY, 450.0)
+    replacement = makeSnapshot(
+        occ("VOO", CHAIN_LATE_EXPIRY, 420.0), "VOO", 20.0, 0.86, CHAIN_LATE_EXPIRY
+    )
+    source = FakeOptionSource(
+        snapshots={held: makeSnapshot(held, "VOO", 24.22, 0.85, HELD_ROLL_EXPIRY)},
+        chainSnapshots=[replacement],
+    )
+    enriched, sleeveTable, trades = runPipeline(
+        [
+            equity("VOO", 35, 55, sleeve="true"),
+            equity("URA", 267, 45),
+            option(held, 1),
+            cash(29371),
+        ],
+        source,
+    )
+    bySymbol = tradesBySymbol(trades)
+    sell = bySymbol[held]
+    buy = bySymbol[replacement.symbol]
+    assert (sell.sharesChange, sell.reason) == (-1, "roll: exit")
+    assert (buy.sharesChange, buy.reason) == (1, "roll: replacement")
+
+    # Each contract row pays at least the 1.99 commission floor + per-contract extras
+    assert sell.transactionCost >= 1.99 + 0.30 + 0.013 + 0.02 + 0.18 + 0.0003
+    assert buy.transactionCost == pytest.approx(1.99 + 0.30 + 0.013 + 0.02 + 0.18 + 0.0003)
+
+    nonCash = [t for t in trades if t.quantityKind != "cash"]
+    cashRow = trades[-1]
+    expectedCash = -sum(t.marketValueChange for t in nonCash) - sum(t.transactionCost for t in nonCash)
+    assert cashRow.marketValueChange == pytest.approx(expectedCash)
+
+
+def test_ae3_keep_pipeline_no_chain_call():
+    held = occ("VOO", HELD_KEEP_EXPIRY, 450.0)
+    source = FakeOptionSource(
+        snapshots={held: makeSnapshot(held, "VOO", 24.22, 0.85, HELD_KEEP_EXPIRY)},
+    )
+    enriched, sleeveTable, trades = runPipeline(
+        [
+            equity("VOO", 35, 55, sleeve="true"),
+            equity("URA", 267, 45),
+            option(held, 2),
+            cash(27646),
+        ],
+        source,
+    )
+    assert source.chainCalls == []  # healthy 20-month contract: no selection call
+    contractTrades = [t for t in trades if t.quantityKind == "contract"]
+    assert len(contractTrades) == 1
+    assert contractTrades[0].sharesChange == -1  # resize only
+    assert contractTrades[0].reason == "resize"
+    _, _, fees = buildExposureReport(enriched, sleeveTable, trades)
+    assert fees == pytest.approx(sum(t.transactionCost for t in trades[:-1]))
+
+
+# --- (c) applyTrades new-instrument regression (join bug) ---
+
+
+def test_apply_trades_new_instrument_gets_price_and_columns():
+    priceSource = FakePriceSource({"VOO": SPOT, "USD": 1.0})
+    enriched = enrichPositions(
+        frameWith([equity("VOO", 35, 100, sleeve="true"), cash(1000)]), priceSource, None
+    )
+    newTrade = Trade(
+        tradeId="1",
+        instrumentId="AAPL",
+        instrumentType="Equity",
+        price=100.0,
+        sharesChange=10.0,
+        marketValueChange=1000.0,
+        transactionCost=1.0,
+        timestamp=TODAY,
+    )
+    post = applyTrades(enriched, [newTrade])
+    byId = {r["instrumentId"]: r for r in post.iter_rows(named=True)}
+
+    aapl = byId["AAPL"]
+    assert aapl["closingPrice"] == pytest.approx(100.0)  # trade price survives the join
+    assert aapl["shares"] == pytest.approx(10.0)
+    assert aapl["marketValue"] == pytest.approx(999.0)  # 1000 - 1 fee
+    assert aapl["kind"] == "equity"
+    assert aapl["targetRatioPct"] == 0.0
+
+    # option rows introduced by trades derive kind too
+    optTrade = Trade(
+        tradeId="2",
+        instrumentId=occ("VOO", CHAIN_LATE_EXPIRY, 420.0),
+        instrumentType=OPTION_TYPE,
+        price=20.0,
+        sharesChange=1.0,
+        marketValueChange=2000.0,
+        timestamp=TODAY,
+    )
+    post = applyTrades(enriched, [optTrade])
+    optRow = {r["instrumentId"]: r for r in post.iter_rows(named=True)}[optTrade.instrumentId]
+    assert optRow["kind"] == "option"
+    assert optRow["closingPrice"] == pytest.approx(20.0)
+
+
+# --- (d) zero trades ---
+
+
+def test_zero_trades_no_fees_no_cash_row_report_still_prints(capsys):
+    # Weights exactly at target with no cash row -> planner emits nothing:
+    # 24500 = 0.55 * MV forces MV = 24500/0.55, hence URA = (MV - 24500)/30
+    priceSource = FakePriceSource({"VOO": SPOT, "URA": 30.0})
+    source = FakeOptionSource()
+    balancedUra = (24500 / 0.55 - 24500) / 30
+    frame = frameWith([equity("VOO", 35, 55), equity("URA", balancedUra, 45)], leverage=1.0)
+    enriched = enrichPositions(frame, priceSource, None)
+    sleeveTable = buildSleeveTable(enriched, 1.0, None)
+    planned = planTrades(enriched, sleeveTable, None, 1.0, source, TODAY)
+    assert planned == []
+
+    trades = executeTrades(planned, enriched, TradingPlatformFactory.getTradingPlatform("futubullUS"))
+    assert trades == []  # no fee artifacts, no cash row
+
+    post = applyTrades(enriched, trades)
+    assert post.height == enriched.height
+    report, achievedLeverage, fees = buildExposureReport(enriched, sleeveTable, trades)
+    assert fees == 0.0
+    assert achievedLeverage == pytest.approx(1.0)  # L = 1: exposure == MV
+    printExposureReport(report, achievedLeverage, fees)  # must not raise
+    assert "VOO" in capsys.readouterr().out  # report table printed
+
+
+# --- (e) legacy equivalence: sells first, buys capped by cash ---
+
+
+def test_legacy_equity_cash_matches_old_share_logic():
+    # MV = 35*700 + 267*30 + 1000 = 33,510
+    # Old logic: VOO over target (24500 vs 18430.5) -> sell 8; URA under
+    # (8010 vs 15079.5) -> want 235 shares, but cash = 1000 + 5600 (VOO sell
+    # proceeds) = 6600 -> capped at int(6600/30) = 220. The cap binds.
+    _, _, trades = runPipeline(
+        [equity("VOO", 35, 55), equity("URA", 267, 45), cash(1000)],
+        FakeOptionSource(),
+        leverage=1.0,
+        designated=None,
+    )
+    bySymbol = tradesBySymbol(trades)
+    assert bySymbol["VOO"].sharesChange == -8
+    assert bySymbol["URA"].sharesChange == 220  # capped by cash, not the 235 ideal
+
+    nonCash = [t for t in trades if t.quantityKind != "cash"]
+    cashRow = trades[-1]
+    assert cashRow.marketValueChange == pytest.approx(
+        -sum(t.marketValueChange for t in nonCash) - sum(t.transactionCost for t in nonCash)
+    )
+
+
+# --- (f) equity-buy truncation vs contract-buy immunity ---
+
+
+def test_equity_buy_truncated_contract_buy_never_truncated():
+    priceSource = FakePriceSource({"X": 700.0, "USD": 1.0})
+    frame = frameWith([equity("X", 10, 100, sleeve="true"), cash(7000)])
+    enriched = enrichPositions(frame, priceSource, None)
+
+    planned = [
+        Trade(
+            tradeId="1", instrumentId="X", instrumentType="Equity", price=700.0,
+            sharesChange=20.0, marketValueChange=14000.0, timestamp=TODAY,
+            quantityKind="share", exposureChange=14000.0, reason="wants 20 shares",
+        ),
+        Trade(
+            tradeId="2", instrumentId=occ("X", CHAIN_LATE_EXPIRY, 420.0),
+            instrumentType=OPTION_TYPE, price=24.22,
+            sharesChange=2.0, marketValueChange=2 * 24.22 * 100, timestamp=TODAY,
+            quantityKind="contract", exposureChange=2 * 100 * 0.85 * 700.0,
+            reason="initiation",
+        ),
+    ]
+    platform = TradingPlatformFactory.getTradingPlatform("futubullUS")
+    trades = executeTrades(planned, enriched, platform)
+
+    contract = next(t for t in trades if t.quantityKind == "contract")
+    share = next(t for t in trades if t.quantityKind == "share")
+    cashRow = next(t for t in trades if t.quantityKind == "cash")
+
+    # Contract buy executed in full despite insufficient cash
+    assert contract.sharesChange == 2
+    assert contract.marketValueChange == pytest.approx(4844.0)
+    # Equity buy capped at int((7000 - 4844) / 700) = 3 shares
+    assert share.sharesChange == 3
+    assert share.marketValueChange == pytest.approx(2100.0)
+    assert share.exposureChange == pytest.approx(2100.0)
+    # Waterfall order: contract buy precedes the equity buy
+    assert trades.index(contract) < trades.index(share)
+    assert cashRow.marketValueChange == pytest.approx(
+        -(4844.0 + 2100.0) - sum(t.transactionCost for t in trades[:-1])
+    )
