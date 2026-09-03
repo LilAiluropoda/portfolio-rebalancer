@@ -1,119 +1,25 @@
-from datetime import date, datetime
-
-import polars as pl
 import pytest
 
-from main import (
-    CASH_TYPE,
-    PriceDataSource,
-    enrichPositions,
-    normalizePositions,
-    validateInputs,
+from main import CASH_TYPE, enrichPositions
+from conftest import (
+    FakeOptionSource,
+    FakePriceSource,
+    cash,
+    equity,
+    frameWith,
+    makeSnapshot,
+    option,
 )
-from options_data import OptionQuoteSource, OptionSnapshot
-
-TIMESTAMP = "2026-08-04"
-
-
-class FakePriceSource(PriceDataSource):
-    def __init__(self, prices: dict[str, float]):
-        self.prices = prices
-        self.fetched: list[str] = []
-
-    def getClosingPrice(self, ticker: str, date) -> float:
-        self.fetched.append(ticker)
-        return self.prices[ticker]
-
-
-class FakeOptionSource(OptionQuoteSource):
-    def __init__(self, snapshots: dict[str, OptionSnapshot], available: set[str] | None = None):
-        self.snapshots = snapshots
-        self.available = available if available is not None else set(snapshots)
-
-    def getSnapshots(self, symbols: list[str]) -> dict[str, OptionSnapshot]:
-        return {s: self.snapshots[s] for s in symbols if s in self.available}
-
-    def getChain(self, **kwargs):
-        raise NotImplementedError
-
-
-def snapshot(symbol, underlying, mid, delta, expiry=date(2027, 1, 15), strike=450.0):
-    return OptionSnapshot(
-        symbol=symbol,
-        underlying=underlying,
-        expiry=expiry,
-        strike=strike,
-        right="C",
-        bid=mid - 0.4,
-        ask=mid + 0.4,
-        mid=mid,
-        delta=delta,
-        iv=0.21,
-        quoteTimestamp=datetime(2026, 9, 1, 16, 0, 0),
-        volume=10.0,
-    )
-
-
-def frameWith(rows):
-    frame = pl.DataFrame(
-        rows,
-        schema={
-            "instrumentId": pl.String,
-            "idType": pl.String,
-            "instrumentType": pl.String,
-            "shares": pl.Float64,
-            "targetRatioPct": pl.Float64,
-            "timestamp": pl.String,
-            "leapsSleeve": pl.String,
-        },
-    )
-    frame = normalizePositions(frame)
-    validateInputs(frame, leverage=1.5, liquidateLeaps=True)
-    return frame
-
 
 VOO_OPTION = "VOO270115C00450000"
 
-
-def equity(ticker, shares, weight, sleeve=None):
-    return {
-        "instrumentId": ticker,
-        "idType": "ticker",
-        "instrumentType": "Equity",
-        "shares": shares,
-        "targetRatioPct": weight,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": sleeve,
-    }
-
-
-def option(symbol, contracts, sleeve=None):
-    return {
-        "instrumentId": symbol,
-        "idType": "occ",
-        "instrumentType": "LEAPS Call",
-        "shares": contracts,
-        "targetRatioPct": None,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": sleeve,
-    }
-
-
-def cash(amount):
-    return {
-        "instrumentId": "USD",
-        "idType": "name",
-        "instrumentType": "Cash and Cash Equivalents",
-        "shares": amount,
-        "targetRatioPct": 0,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": None,
-    }
+# makeSnapshot() in this file used a 0.4 default spread; conftest's makeSnapshot
+# defaults to 0.8 — identical semantics for mid/delta-driven assertions.
 
 
 def test_mixed_frame_valuation_and_exposure():
     priceSource = FakePriceSource({"VOO": 700.0, "URA": 30.0, "USD": 1.0})
-    optionSource = FakeOptionSource({VOO_OPTION: snapshot(VOO_OPTION, "VOO", 24.22, 0.85)})
+    optionSource = FakeOptionSource({VOO_OPTION: makeSnapshot(VOO_OPTION, "VOO", 24.22, 0.85)})
 
     enriched = enrichPositions(
         frameWith(
@@ -151,7 +57,7 @@ def test_mixed_frame_valuation_and_exposure():
 
 def test_option_only_sleeve_fetches_spot_via_price_source():
     priceSource = FakePriceSource({"VOO": 700.0, "URA": 30.0, "USD": 1.0})
-    optionSource = FakeOptionSource({"URA260619C00030000": snapshot("URA260619C00030000", "URA", 5.0, 0.8, strike=30.0)})
+    optionSource = FakeOptionSource({"URA260619C00030000": makeSnapshot("URA260619C00030000", "URA", 5.0, 0.8, strike=30.0)})
 
     enriched = enrichPositions(
         frameWith(
@@ -174,7 +80,7 @@ def test_option_only_sleeve_fetches_spot_via_price_source():
 
 def test_snapshot_delta_flows_to_delta_adj():
     priceSource = FakePriceSource({"VOO": 700.0, "USD": 1.0})
-    optionSource = FakeOptionSource({VOO_OPTION: snapshot(VOO_OPTION, "VOO", 24.22, 0.9399)})
+    optionSource = FakeOptionSource({VOO_OPTION: makeSnapshot(VOO_OPTION, "VOO", 24.22, 0.9399)})
 
     enriched = enrichPositions(
         frameWith([equity("VOO", 35, 100, sleeve="true"), option(VOO_OPTION, 2), cash(1000)]),

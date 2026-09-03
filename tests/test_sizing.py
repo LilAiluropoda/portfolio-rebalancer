@@ -1,50 +1,10 @@
 import pytest
 
-from main import buildSleeveTable, enrichPositions, normalizePositions, sizeSleeve
-from main import PriceDataSource
-from options_data import OptionQuoteSource, OptionSnapshot
+from main import buildSleeveTable, enrichPositions, sizeSleeve
+from conftest import FakeOptionSource, FakePriceSource, cash, equity, frameWith, makeSnapshot, option
 
-from datetime import date, datetime
-
-TIMESTAMP = "2026-08-04"
 VOO_OPTION = "VOO270115C00450000"
 PER_CONTRACT = 100 * 0.85 * 700.0  # 59,500
-
-
-class FakePriceSource(PriceDataSource):
-    def __init__(self, prices):
-        self.prices = prices
-
-    def getClosingPrice(self, ticker, date):
-        return self.prices[ticker]
-
-
-class FakeOptionSource(OptionQuoteSource):
-    def __init__(self, snapshots):
-        self.snapshots = snapshots
-
-    def getSnapshots(self, symbols):
-        return {s: self.snapshots[s] for s in symbols}
-
-    def getChain(self, **kwargs):
-        raise NotImplementedError
-
-
-def makeSnapshot(symbol, underlying, mid, delta):
-    return OptionSnapshot(
-        symbol=symbol,
-        underlying=underlying,
-        expiry=date(2027, 1, 15),
-        strike=450.0,
-        right="C",
-        bid=mid - 0.4,
-        ask=mid + 0.4,
-        mid=mid,
-        delta=delta,
-        iv=0.21,
-        quoteTimestamp=datetime(2026, 9, 1, 16, 0, 0),
-        volume=10.0,
-    )
 
 
 # --- sizeSleeve: pure sizing math (AE2 anchor + clamped signed residual) ---
@@ -154,25 +114,15 @@ def enrichedMixedFrame():
     priceSource = FakePriceSource({"VOO": 700.0, "URA": 30.0, "USD": 1.0})
     optionSource = FakeOptionSource({VOO_OPTION: makeSnapshot(VOO_OPTION, "VOO", 24.22, 0.85)})
 
-    frame = pl_Frame(
+    frame = frameWith(
         [
-            ("VOO", "ticker", "Equity", 35.0, 55.0, "true"),
-            ("URA", "ticker", "Equity", 267.0, 45.0, None),
-            (VOO_OPTION, "occ", "LEAPS Call", 2.0, None, "true"),
-            ("USD", "name", "Cash and Cash Equivalents", 1000.0, 0.0, None),
+            equity("VOO", 35.0, 55.0, sleeve="true"),
+            equity("URA", 267.0, 45.0),
+            option(VOO_OPTION, 2.0, sleeve="true"),
+            cash(1000.0),
         ]
     )
     return enrichPositions(frame, priceSource, optionSource)
-
-
-def pl_Frame(rows):
-    import polars as pl
-
-    columns = ["instrumentId", "idType", "instrumentType", "shares", "targetRatioPct", "leapsSleeve"]
-    data = {c: [r[i] for r in rows] for i, c in enumerate(columns)}
-    data["timestamp"] = [TIMESTAMP] * len(rows)
-    frame = pl.DataFrame(data, schema_overrides={"targetRatioPct": pl.Float64, "leapsSleeve": pl.String})
-    return normalizePositions(frame)
 
 
 def test_sleeve_table_targets_and_holdings():
@@ -213,11 +163,11 @@ def test_sleeve_table_option_only_non_designated_targets_zero():
     optionSource = FakeOptionSource(
         {"URA260619C00030000": makeSnapshot("URA260619C00030000", "URA", 5.0, 0.8)}
     )
-    frame = pl_Frame(
+    frame = frameWith(
         [
-            ("VOO", "ticker", "Equity", 35.0, 100.0, None),
-            ("URA260619C00030000", "occ", "LEAPS Call", 1.0, None, None),
-            ("USD", "name", "Cash and Cash Equivalents", 1000.0, 0.0, None),
+            equity("VOO", 35.0, 100.0),
+            option("URA260619C00030000", 1.0),
+            cash(1000.0),
         ]
     )
     enriched = enrichPositions(frame, priceSource, optionSource)

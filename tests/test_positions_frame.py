@@ -1,67 +1,14 @@
-from datetime import date
-
-import polars as pl
 import pytest
 
-from main import normalizePositions, validateInputs
+from main import validateInputs
 from options_data import OccParseError
-
-TIMESTAMP = "2026-08-04"
-
-
-def equityRow(ticker, shares, weight, sleeve=None):
-    return {
-        "instrumentId": ticker,
-        "idType": "ticker",
-        "instrumentType": "Equity",
-        "shares": shares,
-        "targetRatioPct": weight,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": sleeve,
-    }
-
-
-def optionRow(symbol, contracts, sleeve=None):
-    return {
-        "instrumentId": symbol,
-        "idType": "occ",
-        "instrumentType": "LEAPS Call",
-        "shares": contracts,
-        "targetRatioPct": None,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": sleeve,
-    }
-
-
-def cashRow(amount):
-    return {
-        "instrumentId": "USD",
-        "idType": "name",
-        "instrumentType": "Cash and Cash Equivalents",
-        "shares": amount,
-        "targetRatioPct": 0,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": None,
-    }
+from conftest import cash as cashRow, equity as equityRow, frameWith
+from conftest import option as optionRow
 
 
 def buildFrame(rows, includeSleeveColumn=True):
-    if not includeSleeveColumn:
-        for row in rows:
-            row.pop("leapsSleeve", None)
-    frame = pl.DataFrame(
-        rows,
-        schema={
-            "instrumentId": pl.String,
-            "idType": pl.String,
-            "instrumentType": pl.String,
-            "shares": pl.Float64,
-            "targetRatioPct": pl.Float64,
-            "timestamp": pl.String,
-            **({"leapsSleeve": pl.String} if includeSleeveColumn else {}),
-        },
-    )
-    return normalizePositions(frame)
+    # Normalize only — these tests exercise validateInputs themselves.
+    return frameWith(rows, validate=False, includeSleeveColumn=includeSleeveColumn)
 
 
 def test_mixed_csv_normalizes():
@@ -168,6 +115,14 @@ def test_leverage_below_one_rejected():
 def test_malformed_occ_symbol_rejected():
     with pytest.raises(OccParseError):
         buildFrame([equityRow("VOO", 35, 100), optionRow("VOO270115C00450", 1), cashRow(1000)])
+
+
+def test_put_option_symbol_rejected():
+    # Strategy is call-based stock replacement — puts would corrupt exposure math
+    with pytest.raises(ValueError, match="VOO270115P00450000"):
+        buildFrame(
+            [equityRow("VOO", 35, 100), optionRow("VOO270115P00450000", 1), cashRow(1000)]
+        )
 
 
 def test_liquidation_guard_no_marker():

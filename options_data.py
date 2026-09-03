@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from abc import ABC, abstractmethod
 from datetime import date, datetime
 
@@ -61,8 +62,11 @@ def parseOccSymbol(symbol: str) -> OptionContract:
         )
 
     underlying = symbol[:-15].rstrip()
-    if not underlying:
-        raise OccParseError(f"Invalid OCC option symbol '{symbol}': empty underlying root")
+    if not re.fullmatch(r"[A-Z]{1,6}", underlying):
+        raise OccParseError(
+            f"Invalid OCC option symbol '{symbol}': underlying root must be "
+            "1-6 uppercase A-Z characters"
+        )
 
     return OptionContract(
         symbol=symbol,
@@ -143,12 +147,17 @@ class AlpacaOptionData(OptionQuoteSource):
         }
 
     def _get(self, path: str, params: dict) -> dict:
-        response = requests.get(
-            f"{ALPACA_DATA_BASE_URL}{path}",
-            headers=self._headers(),
-            params=params,
-            timeout=30,
-        )
+        try:
+            response = requests.get(
+                f"{ALPACA_DATA_BASE_URL}{path}",
+                headers=self._headers(),
+                params=params,
+                timeout=30,
+            )
+        except requests.RequestException as e:
+            raise AlpacaApiError(
+                0, f"{type(e).__name__}: {str(e)[:200]}"
+            ) from e
         if response.status_code != 200:
             try:
                 detail = response.json().get("message", "")
@@ -219,7 +228,12 @@ class AlpacaOptionData(OptionQuoteSource):
             _logger.warning("Skipping %s: non-positive quote (bid=%s)", symbol, bid)
             return None
 
-        quoteTimestamp = datetime.fromisoformat(quote["t"].replace("Z", "+00:00"))
+        rawTs = quote.get("t")
+        try:
+            quoteTimestamp = datetime.fromisoformat(str(rawTs).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            _logger.warning("Skipping %s: missing or unparseable quote timestamp (%r)", symbol, rawTs)
+            return None
         if quoteTimestamp.date() != datetime.now().astimezone().date():
             _logger.warning(
                 "Skipping %s: quote timestamp %s is not same-day", symbol, quote["t"]

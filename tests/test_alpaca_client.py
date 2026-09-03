@@ -5,12 +5,15 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 import options_data
+import requests
 from black_scholes import call_delta, implied_volatility
 from options_data import (
     AlpacaApiError,
     AlpacaConfigError,
     AlpacaOptionData,
+    OccParseError,
     OptionDataSourceFactory,
+    parseOccSymbol,
 )
 
 KEY_ID = "test-key-id"
@@ -212,3 +215,90 @@ def test_factoryReturnsAlpacaSource(monkeypatch):
 def test_tooManySymbolsRejected(client):
     with pytest.raises(ValueError, match="100"):
         client.getSnapshots([f"VOO260904C{i:08d}" for i in range(101)])
+
+
+def test_transportErrorSanitized(client, monkeypatch):
+    def fakeGet(*a, **k):
+        raise requests.ConnectionError("DNS failure: data.alpaca.markets unreachable")
+
+    monkeypatch.setattr(options_data.requests, "get", fakeGet)
+    with pytest.raises(AlpacaApiError) as excInfo:
+        client.getSnapshots(["VOO260904C00680000"])
+    assert excInfo.value.statusCode == 0
+    message = str(excInfo.value)
+    assert "ConnectionError" in message
+    assert KEY_ID not in message
+    assert SECRET not in message
+    assert "APCA" not in message
+
+
+def test_missingQuoteTimestampSkipped(client, monkeypatch):
+    payload = makeSnapshotPayload()
+    payload["VOO260904C00680000"]["latestQuote"].pop("t")
+    monkeypatch.setattr(
+        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+    )
+    assert client.getSnapshots(["VOO260904C00680000"]) == {}
+
+
+def test_malformedQuoteTimestampSkipped(client, monkeypatch):
+    payload = makeSnapshotPayload(ts="not-a-timestamp")
+    monkeypatch.setattr(
+        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+    )
+    assert client.getSnapshots(["VOO260904C00680000"]) == {}
+
+
+@pytest.mark.parametrize(
+    "root",
+    ["voo", "GOOG/evil", "AAPL?x=1", "SPXW1234X", ""],
+)
+def test_invalidUnderlyingRootRejected(root):
+    with pytest.raises(OccParseError):
+        parseOccSymbol(f"{root}260904C00680000")
+
+
+def test_sixCharRootAccepted():
+    contract = parseOccSymbol("ABCDEF260904C00680000")
+    assert contract.underlying == "ABCDEF"
+
+
+# --- _fallbackDelta branches: expired contract and missing underlying price ---
+
+
+def test_expiredContractNullGreeksIntrinsicDeltaITM(client, monkeypatch):
+    # Expiry in the past, null greeks, strike < spot -> intrinsic delta 1.0
+    payload = makeSnapshotPayload(
+        delta=None, iv=None, bp=250.0, ap=252.0, underlyingPrice=700.0,
+        symbol="VOO250904C00450000",  # expired 2025-09-04
+    )
+    monkeypatch.setattr(
+        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+    )
+    snap = client.getSnapshots(["VOO250904C00450000"])["VOO250904C00450000"]
+    assert snap.delta == 1.0
+    assert snap.iv == 0.0  # nothing to solve for
+
+
+def test_expiredContractNullGreeksIntrinsicDeltaOTM(client, monkeypatch):
+    # Same, but strike > spot -> intrinsic delta 0.0; no crash either way
+    payload = makeSnapshotPayload(
+        delta=None, iv=None, bp=0.05, ap=0.15, underlyingPrice=700.0,
+        symbol="VOO250904C00900000",  # expired, strike 900
+    )
+    monkeypatch.setattr(
+        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+    )
+    snap = client.getSnapshots(["VOO250904C00900000"])["VOO250904C00900000"]
+    assert snap.delta == 0.0
+
+
+def test_nullGreeksNoUnderlyingPriceRaisesNamingSymbol(client, monkeypatch):
+    payload = makeSnapshotPayload(
+        delta=None, iv=None, underlyingPrice=None, symbol="VOO280121C00450000"
+    )
+    monkeypatch.setattr(
+        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+    )
+    with pytest.raises(AlpacaApiError, match="VOO280121C00450000"):
+        client.getSnapshots(["VOO280121C00450000"])

@@ -1,19 +1,26 @@
 from datetime import date, datetime
+from types import SimpleNamespace
 
 import polars as pl
 import pytest
 
 from main import (
+    _passesLiquidityFilter,
     buildSleeveTable,
     enrichPositions,
-    normalizePositions,
     planTrades,
-    validateInputs,
-    PriceDataSource,
+    sizeSleeve,
 )
-from options_data import OptionQuoteSource, OptionSnapshot
+from conftest import (
+    FakeOptionSource,
+    FakePriceSource,
+    cash,
+    equity,
+    frameWith,
+    makeSnapshot,
+    option,
+)
 
-TIMESTAMP = "2026-08-04"
 TODAY = datetime(2026, 9, 2, 10, 0, 0)  # planTrades reference date
 
 # Held / chain contract dates relative to TODAY (2026-09-02)
@@ -32,110 +39,16 @@ def occ(root: str, expiry: date, strike: float) -> str:
     return f"{root}{expiry:%y%m%d}C{int(strike * 1000):08d}"
 
 
-class FakePriceSource(PriceDataSource):
-    def __init__(self, prices):
-        self.prices = prices
-
-    def getClosingPrice(self, ticker, date):
-        return self.prices[ticker]
-
-
-class FakeOptionSource(OptionQuoteSource):
-    """Snapshots answer getSnapshots; chainSnapshots answer getChain (spy included)."""
-
-    def __init__(self, snapshots=None, chainSnapshots=None):
-        self.snapshots = snapshots or {}
-        self.chainSnapshots = chainSnapshots or []
-        self.chainCalls: list[str | None] = []
-
-    def getSnapshots(self, symbols):
-        return {s: self.snapshots[s] for s in symbols}
-
-    def getChain(self, underlying, expirationDateGte=None, strikePriceGte=None,
-                 strikePriceLte=None, optionType="call"):
-        self.chainCalls.append(expirationDateGte)
-        return {s.symbol: s for s in self.chainSnapshots}
-
-
-def makeSnapshot(symbol, underlying, mid, delta, expiry, volume=10.0, spread=0.8):
-    return OptionSnapshot(
-        symbol=symbol,
-        underlying=underlying,
-        expiry=expiry,
-        strike=450.0,
-        right="C",
-        bid=mid - spread,
-        ask=mid + spread,
-        mid=mid,
-        delta=delta,
-        iv=0.21,
-        quoteTimestamp=datetime(2026, 9, 2, 16, 0, 0),
-        volume=volume,
-    )
-
-
-def frameWith(rows):
-    frame = pl.DataFrame(
-        rows,
-        schema={
-            "instrumentId": pl.String,
-            "idType": pl.String,
-            "instrumentType": pl.String,
-            "shares": pl.Float64,
-            "targetRatioPct": pl.Float64,
-            "timestamp": pl.String,
-            "leapsSleeve": pl.String,
-        },
-    )
-    frame = normalizePositions(frame)
-    validateInputs(frame, leverage=1.5, liquidateLeaps=True)
-    return frame
-
-
-def equity(ticker, shares, weight, sleeve=None):
-    return {
-        "instrumentId": ticker,
-        "idType": "ticker",
-        "instrumentType": "Equity",
-        "shares": shares,
-        "targetRatioPct": weight,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": sleeve,
-    }
-
-
-def option(symbol, contracts, sleeve=None):
-    return {
-        "instrumentId": symbol,
-        "idType": "occ",
-        "instrumentType": "LEAPS Call",
-        "shares": contracts,
-        "targetRatioPct": None,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": sleeve,
-    }
-
-
-def cash(amount):
-    return {
-        "instrumentId": "USD",
-        "idType": "name",
-        "instrumentType": "Cash and Cash Equivalents",
-        "shares": amount,
-        "targetRatioPct": 0,
-        "timestamp": TIMESTAMP,
-        "leapsSleeve": None,
-    }
-
-
-def planFor(rows, optionSource, leverage=1.5, designated="VOO"):
+def planFor(rows, optionSource, leverage=1.5, designated="VOO", liquidateLeaps=False):
     priceSource = FakePriceSource({"VOO": SPOT, "URA": 30.0, "USD": 1.0})
     frame = frameWith(rows)
     if designated is not None:
         assert frame.filter(pl.col("leapsSleeve")).height > 0 or designated == "VOO"
     enriched = enrichPositions(frame, priceSource, optionSource)
     table = buildSleeveTable(enriched, leverage, designated)
-    return planTrades(enriched, table, designated, leverage, optionSource, TODAY)
+    return planTrades(
+        enriched, table, designated, leverage, optionSource, TODAY, liquidateLeaps=liquidateLeaps
+    )
 
 
 def tradesBySymbol(trades):
@@ -347,6 +260,54 @@ def test_roll_deferred_when_candidates_only_below_floor():
     assert not any(t.instrumentId == deep.symbol for t in trades)
 
 
+# --- Size guards ---
+
+
+def test_size_sleeve_rejects_nonpositive_per_contract_exposure():
+    with pytest.raises(ValueError, match="(?i)per-contract exposure"):
+        sizeSleeve(targetExposure=1000.0, perContractExposure=0.0, heldContracts=0, heldShares=0, spot=700.0)
+
+
+
+def test_size_sleeve_rejects_nonpositive_spot():
+    with pytest.raises(ValueError, match="spot"):
+        sizeSleeve(targetExposure=1000.0, perContractExposure=59500.0, heldContracts=0, heldShares=0, spot=0.0)
+
+
+# --- --liquidate-leaps full exit ---
+
+
+def test_liquidate_leaps_flag_forces_full_exit_at_base_weight():
+    held = occ("VOO", HELD_KEEP_EXPIRY, 450.0)
+    source = FakeOptionSource(
+        snapshots={held: makeSnapshot(held, "VOO", 24.22, 0.85, HELD_KEEP_EXPIRY)},
+    )
+    trades = planFor(
+        [
+            equity("VOO", 35, 55, sleeve="true"),
+            equity("URA", 267, 45),
+            option(held, 2),
+            cash(27646),
+        ],
+        source,
+        leverage=1.0,
+        liquidateLeaps=True,
+    )
+    contractTrades = [t for t in trades if t.quantityKind == "contract"]
+    assert len(contractTrades) == 1
+    assert contractTrades[0].instrumentId == held
+    assert contractTrades[0].sharesChange == -2  # full exit, not resize
+    assert contractTrades[0].reason == "liquidation: --liquidate-leaps"
+
+    shareTrades = [t for t in trades if t.instrumentId == "VOO" and t.quantityKind == "share"]
+    assert len(shareTrades) == 1
+    assert shareTrades[0].reason == "liquidation: --liquidate-leaps"
+    # Shares sized to base weight (0.55 x MV), not the leveraged sleeve target
+    totalMV = 35 * SPOT + 2 * 24.22 * 100 + 267 * 30.0 + 27646
+    expectedShares = int((0.55 * totalMV - 35 * SPOT) / SPOT)
+    assert shareTrades[0].sharesChange == pytest.approx(float(expectedShares))
+
+
 # --- R17: liquidation ---
 
 
@@ -399,3 +360,110 @@ def test_plain_equity_sleeve_drift_rebalance():
     byId = tradesBySymbol(trades)
     assert byId["URA"].sharesChange == pytest.approx(float(int((0.45 * totalMV - 267 * 30.0) / 30.0)))
     assert byId["VOO"].sharesChange == pytest.approx(float(int((0.55 * totalMV - 35 * SPOT) / SPOT)))
+
+
+# --- Ladder: two held expiries in the keep window resize on the EARLIEST row ---
+
+
+def test_ladder_two_expiries_resize_anchored_on_earliest_row_delta():
+    # Two option rows, both > 12 months out (keep path), different deltas.
+    # Resize sizing must use the EARLIEST-expiry row's own per-contract
+    # exposure (anchor), not the sleeve average.
+    earliest = occ("VOO", HELD_KEEP_EXPIRY, 450.0)            # 2028-05-18, delta 0.85
+    latest = occ("VOO", date(2028, 9, 15), 450.0)             # 2028-09-15, delta 0.70
+    source = FakeOptionSource(
+        snapshots={
+            earliest: makeSnapshot(earliest, "VOO", 24.22, 0.85, HELD_KEEP_EXPIRY),
+            latest: makeSnapshot(latest, "VOO", 30.0, 0.70, date(2028, 9, 15)),
+        }
+    )
+    trades = planFor(
+        [
+            equity("VOO", 35, 55, sleeve="true"),
+            equity("URA", 267, 45),
+            option(earliest, 1),
+            option(latest, 1),
+            cash(268068),
+        ],
+        source,
+    )
+
+    assert source.chainCalls == []  # keep window: no selection call
+
+    contractTrades = [t for t in trades if t.quantityKind == "contract"]
+    assert len(contractTrades) == 1
+    anchorTrade = contractTrades[0]
+    assert anchorTrade.instrumentId == earliest  # earliest expiry is the anchor
+    assert anchorTrade.reason == "resize"
+
+    totalMV = 35 * SPOT + 24.22 * 100 + 30.0 * 100 + 267 * 30.0 + 268068
+    assert totalMV == pytest.approx(306000.0)
+    targetExposure = (0.55 + 0.5) * totalMV  # 321,300
+    anchorPerContract = 100 * 0.85 * SPOT    # 59,500 (earliest row's own delta)
+    sleeveAvgPerContract = 100 * ((0.85 + 0.70) / 2) * SPOT  # 54,250 — the old bug
+
+    desiredAnchor = round(targetExposure / anchorPerContract)  # 5
+    desiredSleeveAvg = round(targetExposure / sleeveAvgPerContract)  # 6 — old bug
+    assert desiredAnchor != desiredSleeveAvg  # the two rules genuinely diverge here
+
+    assert anchorTrade.sharesChange == float(desiredAnchor - 2)  # buy up to 5
+    assert anchorTrade.exposureChange == pytest.approx(
+        (desiredAnchor - 2) * anchorPerContract
+    )
+
+    # Post-plan contract counts are consistent with the ANCHOR row's delta:
+    # 5 contracts x 59,500 + whole-share residual == target exposure
+    # (integer share flooring leaves at most one share of tracking error).
+    postContracts = 2 + int(anchorTrade.sharesChange)
+    assert postContracts == desiredAnchor  # 5 — the sleeve-average rule would give 6
+    shareTrades = [t for t in trades if t.instrumentId == "VOO" and t.quantityKind == "share"]
+    shareChange = sum(t.sharesChange for t in shareTrades)
+    assert postContracts * anchorPerContract + shareChange * SPOT == pytest.approx(
+        targetExposure, abs=SPOT
+    )
+    assert any(t.reason == "drift rebalance" for t in shareTrades)
+    # The later-expiry row is untouched
+    assert not any(t.instrumentId == latest for t in trades)
+
+
+# --- Liquidity filter branches (R12) ---
+
+
+def test_zero_volume_candidate_fails_liquidity_filter_to_shares_fallback():
+    # Candidate passes spread and expiry-floor checks but volume = 0 -> filtered
+    zeroVolume = makeSnapshot(
+        occ("VOO", CHAIN_LATE_EXPIRY, 420.0), "VOO", 20.0, 0.86,
+        CHAIN_LATE_EXPIRY, volume=0.0,
+    )
+    source = FakeOptionSource(chainSnapshots=[zeroVolume])
+    trades = planFor(
+        [
+            equity("VOO", 35, 55, sleeve="true"),
+            equity("URA", 267, 45),
+            cash(29371),
+        ],
+        source,
+    )
+    assert all(t.quantityKind != "contract" for t in trades)
+    assert any(t.reason == "shares fallback: no qualifying contract" for t in trades)
+
+
+def test_passes_liquidity_filter_branches_direct():
+    # mid <= 0 is unreachable via _parseSnapshot (bid > 0 guard keeps mid > 0),
+    # so exercise the branch directly with a synthetic snapshot.
+    assert _passesLiquidityFilter(SimpleNamespace(mid=0.0, bid=-1.0, ask=1.0, volume=100.0)) is False
+    # Healthy quote passes
+    assert (
+        _passesLiquidityFilter(SimpleNamespace(mid=10.0, bid=9.5, ask=10.5, volume=100.0))
+        is True
+    )
+    # Volume below the floor fails
+    assert (
+        _passesLiquidityFilter(SimpleNamespace(mid=10.0, bid=9.5, ask=10.5, volume=0.0))
+        is False
+    )
+    # Spread above the cap fails
+    assert (
+        _passesLiquidityFilter(SimpleNamespace(mid=10.0, bid=5.0, ask=15.0, volume=100.0))
+        is False
+    )

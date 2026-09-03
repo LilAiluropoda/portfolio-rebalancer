@@ -214,6 +214,13 @@ def sizeSleeve(
     """
     if targetExposure < 0:
         raise ValueError(f"Sleeve target exposure must be >= 0, got {targetExposure}")
+    if perContractExposure <= 0:
+        raise ValueError(
+            f"Per-contract exposure must be > 0, got {perContractExposure} "
+            "(check spot price and contract delta)"
+        )
+    if spot <= 0:
+        raise ValueError(f"Underlying spot price must be > 0, got {spot}")
 
     desiredContracts = int(math.floor(targetExposure / perContractExposure + 0.5))
     contractChange = desiredContracts - int(heldContracts)
@@ -313,13 +320,21 @@ def _pickCandidate(candidates) -> OptionSnapshot:
 
 
 def selectContract(
-    optionSource: OptionQuoteSource, underlying: str, today: date
+    optionSource: OptionQuoteSource | None, underlying: str, today: date
 ) -> tuple[OptionSnapshot | None, str]:
     """
     Rule-based contract selection (R12). Returns (snapshot | None, outcome) where
     outcome is "selected", "deferred" (chain-depth: candidates exist only below
     MIN_EXPIRY_MONTHS, R21), or "none" (no candidate passes the liquidity filter).
+    A missing option source degrades to "none" (shares fallback).
     """
+    if optionSource is None:
+        logger.warning(
+            f"[Contract Selection] {underlying}: no option data source available — "
+            "falling back to shares"
+        )
+        return None, "none"
+
     expiryFloor = addMonths(today, MIN_EXPIRY_MONTHS)
     chain = optionSource.getChain(
         underlying, expirationDateGte=expiryFloor.isoformat(), optionType="call"
@@ -360,8 +375,9 @@ def planTrades(
     sleeveTable: pl.DataFrame,
     designatedUnderlying: str | None,
     leverage: float,
-    optionSource: OptionQuoteSource,
+    optionSource: OptionQuoteSource | None,
     tradeTimestamp: datetime,
+    liquidateLeaps: bool = False,
 ) -> list[Trade]:
     """
     Sleeve planner: walk the sleeve table and emit per-sleeve order intents
@@ -421,17 +437,20 @@ def planTrades(
         )
 
     def emitResize(
-        sleeve: dict, heldPerContractExposure: float, heldContracts: float,
+        sleeve: dict, heldContracts: float,
         heldShares: float, spot: float, anchorRow: dict,
         contractReason: str, shareReason: str,
     ) -> None:
+        # Resize sizing uses the ANCHOR row's own per-contract exposure, not the
+        # sleeve average — mixed-delta sleeves would otherwise mis-size counts.
+        anchorPerContractExposure = OPTION_MULTIPLIER * anchorRow["deltaAdj"] * spot
         plan = sizeSleeve(
-            sleeve["targetExposure"], heldPerContractExposure, heldContracts, heldShares, spot
+            sleeve["targetExposure"], anchorPerContractExposure, heldContracts, heldShares, spot
         )
         if plan.contractChange != 0:
             emitContract(
                 sleeve["underlying"], anchorRow["instrumentId"], plan.contractChange,
-                anchorRow["closingPrice"], heldPerContractExposure, spot, contractReason,
+                anchorRow["closingPrice"], anchorPerContractExposure, spot, contractReason,
             )
         if plan.shareChange != 0:
             emitShares(sleeve["underlying"], int(plan.shareChange), spot, shareReason)
@@ -469,6 +488,20 @@ def planTrades(
             continue
 
         # --- Designated sleeve lifecycle ---
+        if liquidateLeaps:
+            # Full-exit liquidation: sell every held contract and re-size the
+            # sleeve to its base weight in shares, regardless of L.
+            for row in heldOptionRows:
+                emitContract(
+                    underlying, row["instrumentId"], -row["shares"], row["closingPrice"],
+                    OPTION_MULTIPLIER * row["deltaAdj"] * spot, spot,
+                    "liquidation: --liquidate-leaps",
+                )
+            shareChange = _bestEffortInt((baseWeightExposure - equityExposure) / spot, heldShares)
+            if shareChange != 0:
+                emitShares(underlying, shareChange, spot, "liquidation: --liquidate-leaps")
+            continue
+
         if heldContracts == 0:
             # R11: initiate
             snap, outcome = selectContract(optionSource, underlying, today)
@@ -495,15 +528,11 @@ def planTrades(
             heldOptionRows, key=lambda r: parseOccSymbol(r["instrumentId"]).expiry
         )
         monthsToExpiry = monthsBetween(parseOccSymbol(earliestRow["instrumentId"]).expiry, today)
-        heldOptionExposure = sum(
-            row["shares"] * OPTION_MULTIPLIER * row["deltaAdj"] * spot for row in heldOptionRows
-        )
-        heldPerContract = heldOptionExposure / heldContracts
 
         if monthsToExpiry > ROLL_MONTHS_THRESHOLD:
             # R9: keep — resize quantity only, no selection call
             emitResize(
-                sleeve, heldPerContract, heldContracts, heldShares, spot, earliestRow,
+                sleeve, heldContracts, heldShares, spot, earliestRow,
                 "resize", "drift rebalance",
             )
             continue
@@ -532,7 +561,7 @@ def planTrades(
                 f"(no qualifying expiry >= {MIN_EXPIRY_MONTHS} months)"
             )
             emitResize(
-                sleeve, heldPerContract, heldContracts, heldShares, spot, earliestRow,
+                sleeve, heldContracts, heldShares, spot, earliestRow,
                 "roll deferred — chain depth", "roll deferred — chain depth",
             )
         else:
@@ -569,10 +598,15 @@ def normalizePositions(positionDF: pl.DataFrame) -> pl.DataFrame:
     )
 
     optionRows = positionDF.filter(pl.col("kind") == "option")
-    rootBySymbol = {
-        row["instrumentId"]: parseOccSymbol(row["instrumentId"]).underlying
-        for row in optionRows.iter_rows(named=True)
-    }
+    rootBySymbol = {}
+    for row in optionRows.iter_rows(named=True):
+        parsed = parseOccSymbol(row["instrumentId"])
+        if parsed.right != "C":
+            raise ValueError(
+                f"Option {row['instrumentId']} is a {parsed.right} option — the strategy is "
+                "call-based stock replacement; puts would corrupt exposure math"
+            )
+        rootBySymbol[row["instrumentId"]] = parsed.underlying
 
     positionDF = positionDF.with_columns(
         pl.when(pl.col("kind") == "option")
@@ -630,7 +664,7 @@ def validateInputs(positionDF: pl.DataFrame, leverage: float, liquidateLeaps: bo
 
 
 def getAvailableCash(positionEnrichedDF: pl.DataFrame) -> tuple[bool, float]:
-    cashRows = positionEnrichedDF.filter(pl.col("instrumentType") == CASH_TYPE)
+    cashRows = positionEnrichedDF.filter(pl.col("kind") == "cash")
     cashAvailable: float = (
         cashRows.select(pl.col("marketValue").sum()).item() if len(cashRows) > 0 else 0.0
     )
@@ -850,8 +884,10 @@ def executeTrades(
         trade.calcTransactionCost(platform=tradingPlatform)
     totalFees = sum(t.transactionCost for t in executed)
 
-    # Cash residual row (R20): -(net trade flow) - fees; fees are paid from cash
-    if abs(netCashUsed) > 0.01:
+    # Cash residual row (R20): -(net trade flow) - fees; fees are paid from cash.
+    # Emitted whenever there is net flow OR any fees, so premium-neutral rolls
+    # still ledger their fees.
+    if abs(netCashUsed) > 0.01 or totalFees > 0:
         cashMovement = -netCashUsed - totalFees
         executed.append(
             Trade(
@@ -898,10 +934,21 @@ def applyTrades(positionEnrichedDF: pl.DataFrame, trades: list[Trade]) -> pl.Dat
             "underlyingTrade": t.underlying or t.instrumentId,
             "kindTrade": _kindForInstrumentType(t.instrumentType),
             "sharesChange": t.sharesChange,
-            "marketValueChange": t.marketValueChange - t.transactionCost,  # Apply transaction cost here
+            "marketValueChange": t.marketValueChange,
             "closingPriceTrade": t.price,
         } for t in trades],
         schema=tradesSchema,
+    )
+    # Aggregate per instrumentId so duplicate rows (e.g. duplicate CSV option
+    # rows) cannot fan out into a cartesian full join. Fees live solely in the
+    # cash residual row (R20), not per-row.
+    tradesDF = tradesDF.group_by("instrumentId").agg(
+        pl.col("sharesChange").sum(),
+        pl.col("marketValueChange").sum(),
+        pl.col("instrumentTypeTrade").first(),
+        pl.col("underlyingTrade").first(),
+        pl.col("kindTrade").first(),
+        pl.col("closingPriceTrade").first(),
     )
     logger.info(f"[Trade Execution] Numbers of trades to be executed: {len(tradesDF)}")
 
@@ -922,7 +969,7 @@ def applyTrades(positionEnrichedDF: pl.DataFrame, trades: list[Trade]) -> pl.Dat
                 pl.coalesce(pl.col("shares"), pl.lit(0.0)) +
                 pl.coalesce(pl.col("sharesChange"), pl.lit(0.0))
             ).alias("shares"),
-            # Post-trade market value (fees already deducted in tradesDF)
+            # Post-trade market value (fees are netted solely via the cash row)
             (
                 pl.coalesce(pl.col("marketValue"), pl.lit(0.0)) +
                 pl.coalesce(pl.col("marketValueChange"), pl.lit(0.0))
@@ -1117,7 +1164,10 @@ def main():
     priceDataSource: PriceDataSource = DataSourceFactory.getDataSource(name=DATASOURCE)
     logger.info(f"[Data Loading] Data source selected: {DATASOURCE}")
     optionSource = None
-    if positionDF.filter(pl.col("kind") == "option").height > 0:
+    if (
+        positionDF.filter(pl.col("kind") == "option").height > 0
+        or designatedUnderlying is not None
+    ):
         optionSource = OptionDataSourceFactory.getDataSource("alpaca")
         logger.info(f"[Data Loading] Option data source selected: alpaca")
     positionEnrichedDF = enrichPositions(positionDF, priceDataSource, optionSource)
@@ -1131,7 +1181,7 @@ def main():
     sleeveTable = buildSleeveTable(positionEnrichedDF, args.leverage, designatedUnderlying)
     plannedTrades = planTrades(
         positionEnrichedDF, sleeveTable, designatedUnderlying, args.leverage,
-        optionSource, tradeTimestamp,
+        optionSource, tradeTimestamp, liquidateLeaps=args.liquidateLeaps,
     )
     trades = executeTrades(plannedTrades, positionEnrichedDF, tradingPlatform)
 
