@@ -1,14 +1,15 @@
+"""Market-data providers: equity prices (yfinance) and option quotes (Alpaca)."""
+
 import logging
 import os
 import re
 from abc import ABC, abstractmethod
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import requests
+import yfinance as yf
 from dotenv import load_dotenv
 from pydantic import BaseModel
-
-from black_scholes import callDelta, impliedVolatility
 
 _logger = logging.getLogger("Portfolio Rebalancer")
 
@@ -90,6 +91,75 @@ class OptionSnapshot(BaseModel):
     iv: float
     quoteTimestamp: datetime
     volume: float
+
+
+class PriceDataSource(ABC):
+    @abstractmethod
+    def getClosingPrice(self, ticker: str, date: datetime) -> float:
+        pass
+
+    def getClosingPrices(self, tickers: list[str], date: datetime) -> dict[str, float]:
+        """Batched closing prices; default delegates per-ticker."""
+        return {ticker: self.getClosingPrice(ticker, date) for ticker in tickers}
+
+
+class YFinancePriceData(PriceDataSource):
+    def getClosingPrice(self, ticker: str, date: datetime):
+        try:
+            if ticker == "USD":
+                return 1.0
+
+            instrumentQuote = yf.download(
+                ticker, start=date, end=date + timedelta(days=1), progress=False
+            )
+
+            if instrumentQuote.empty:
+                raise Exception(f"No data available for {ticker} on {date}")
+
+            closingPrice: float = instrumentQuote["Close"].squeeze().item()
+            return float(closingPrice)
+
+        except Exception as e:
+            raise Exception(f"Error fetching data for {ticker} on {date}: {str(e)}")
+
+    def getClosingPrices(self, tickers: list[str], date: datetime) -> dict[str, float]:
+        try:
+            prices: dict[str, float] = {t: 1.0 for t in tickers if t == "USD"}
+            fetch = [t for t in tickers if t != "USD"]
+            if not fetch:
+                return prices
+
+            instrumentQuote = yf.download(
+                tickers=fetch, start=date, end=date + timedelta(days=1), progress=False
+            )
+            if instrumentQuote.empty:
+                raise Exception(f"No data available for {fetch} on {date}")
+
+            close = instrumentQuote["Close"]
+            for ticker in fetch:
+                # Multi-ticker downloads give a (Price, Ticker) column pair;
+                # single-ticker downloads may collapse to a bare Series.
+                series = close[ticker] if hasattr(close, "columns") else close
+                if series.isna().all():
+                    raise Exception(f"No data available for {ticker} on {date}")
+                prices[ticker] = float(series.dropna().iloc[-1])
+            return prices
+
+        except Exception as e:
+            raise Exception(f"Error fetching data for {tickers} on {date}: {str(e)}")
+
+
+class DataSourceFactory:
+    instances: dict[str, PriceDataSource] = {}
+    @classmethod
+    def getDataSource(cls, name: str)-> PriceDataSource:
+        match name:
+            case "yFinance":
+                if name not in cls.instances:
+                    cls.instances[name] = YFinancePriceData()
+                return cls.instances["yFinance"]
+            case _:
+                raise Exception(f"Source {name} not found / supported.")
 
 
 class AlpacaConfigError(Exception):
@@ -250,12 +320,13 @@ class AlpacaOptionData(OptionQuoteSource):
             return None
 
         mid = (bid + ask) / 2
-        iv = raw.get("impliedVolatility")
         greeks = raw.get("greeks") or {}
         delta = greeks.get("delta")
-
         if delta is None:
-            delta, iv = self._fallbackDelta(contract, raw, mid, iv)
+            _logger.warning(
+                "Skipping %s: greeks.delta is null (no fallback estimation)", symbol
+            )
+            return None
 
         return OptionSnapshot(
             symbol=symbol,
@@ -267,35 +338,10 @@ class AlpacaOptionData(OptionQuoteSource):
             ask=ask,
             mid=mid,
             delta=delta,
-            iv=iv if iv is not None else 0.0,
+            iv=raw.get("impliedVolatility") or 0.0,
             quoteTimestamp=quoteTimestamp,
             volume=raw.get("dailyBar", {}).get("volume", 0) or 0,
         )
-
-    def _fallbackDelta(
-        self, contract: OptionContract, raw: dict, mid: float, iv: float | None
-    ) -> tuple[float, float]:
-        underlyingAsset = raw.get("underlyingAsset") or {}
-        spot = underlyingAsset.get("price") or underlyingAsset.get("close")
-        if not spot:
-            raise AlpacaApiError(
-                200,
-                f"Cannot compute Black-Scholes fallback delta for {contract.symbol}: "
-                "greeks null and no underlying price in snapshot",
-            )
-        timeToExpiry = (contract.expiry - datetime.now(timezone.utc).date()).days / 365.0
-        if timeToExpiry <= 0:
-            _logger.warning(
-                "Contract %s has expired; fallback delta treated as intrinsic",
-                contract.symbol,
-            )
-            timeToExpiry = 1e-6
-            delta = 1.0 if contract.strike < spot else 0.0
-            return delta, iv if iv is not None else 0.0
-        if iv is None:
-            iv = impliedVolatility(mid, spot, contract.strike, timeToExpiry)
-        delta = callDelta(spot, contract.strike, timeToExpiry, iv)
-        return delta, iv
 
 
 class OptionDataSourceFactory:

@@ -4,10 +4,10 @@ from types import SimpleNamespace
 import polars as pl
 import pytest
 
-from main import (
+from main import enrichPositions
+from planning import (
     _passesLiquidityFilter,
     buildSleeveTable,
-    enrichPositions,
     planTrades,
     sizeSleeve,
 )

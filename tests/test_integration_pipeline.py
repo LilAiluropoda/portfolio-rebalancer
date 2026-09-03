@@ -2,19 +2,16 @@ from datetime import date, datetime
 
 import pytest
 
-from main import (
-    CASH_TYPE,
-    OPTION_TYPE,
-    TradingPlatformFactory,
+from constants import CASH_TYPE, OPTION_TYPE
+from execution import (
     applyTrades,
     buildExposureReport,
-    buildSleeveTable,
-    enrichPositions,
     executeTrades,
-    planTrades,
     printExposureReport,
-    Trade,
 )
+from fees import TradingPlatformFactory
+from main import enrichPositions
+from planning import Trade, buildSleeveTable, planTrades
 from conftest import (
     CHAIN_LATE_EXPIRY,
     FakeOptionSource,

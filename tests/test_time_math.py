@@ -2,7 +2,7 @@
 
 from datetime import date
 
-from main import ROLL_MONTHS_THRESHOLD, addMonths, monthsBetween
+from planning import ROLL_MONTHS_THRESHOLD, addMonths, monthsBetween
 
 
 # --- monthsBetween: whole elapsed months, day-aware floor semantics ---

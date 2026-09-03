@@ -2,7 +2,8 @@ from datetime import datetime
 
 import pytest
 
-from main import FutuBullUS, Trade
+from fees import FutuBullUS
+from planning import Trade
 
 platform = FutuBullUS()
 

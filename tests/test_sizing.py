@@ -1,6 +1,7 @@
 import pytest
 
-from main import buildSleeveTable, enrichPositions, sizeSleeve
+from main import enrichPositions
+from planning import buildSleeveTable, sizeSleeve
 from conftest import FakeOptionSource, FakePriceSource, cash, equity, frameWith, makeSnapshot, option
 
 VOO_OPTION = "VOO270115C00450000"

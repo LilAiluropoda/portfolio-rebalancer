@@ -4,10 +4,9 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-import options_data
+import market_data
 import requests
-from black_scholes import callDelta, impliedVolatility
-from options_data import (
+from market_data import (
     AlpacaApiError,
     AlpacaConfigError,
     AlpacaOptionData,
@@ -69,7 +68,7 @@ def test_snapshotHappyPath(client, monkeypatch):
         called["url"], called["headers"], called["params"] = url, headers, params
         return FakeResponse(json_data={"snapshots": payload})
 
-    monkeypatch.setattr(options_data.requests, "get", fakeGet)
+    monkeypatch.setattr(market_data.requests, "get", fakeGet)
     result = client.getSnapshots(["VOO260904C00680000"])
 
     assert called["url"].startswith("https://data.alpaca.markets/v1beta1/options/snapshots")
@@ -103,7 +102,7 @@ def test_chainPagination(client, monkeypatch):
             return FakeResponse(json_data=page2)
         return FakeResponse(json_data=page1)
 
-    monkeypatch.setattr(options_data.requests, "get", fakeGet)
+    monkeypatch.setattr(market_data.requests, "get", fakeGet)
     result = client.getChain("VOO")
 
     assert set(result) == {"VOO260904C00680000", "VOO280121C00690000"}
@@ -122,7 +121,7 @@ def test_chainPaginationCap(client, monkeypatch):
         payload["next_page_token"] = f"page{calls['n'] + 1}"
         return FakeResponse(json_data=payload)
 
-    monkeypatch.setattr(options_data.requests, "get", fakeGet)
+    monkeypatch.setattr(market_data.requests, "get", fakeGet)
     with pytest.raises(AlpacaApiError, match="50 pages"):
         client.getChain("VOO")
     assert calls["n"] == 50
@@ -135,7 +134,7 @@ def test_chainFiltersForwarded(client, monkeypatch):
         seen["url"], seen["params"] = url, params
         return FakeResponse(json_data={})
 
-    monkeypatch.setattr(options_data.requests, "get", fakeGet)
+    monkeypatch.setattr(market_data.requests, "get", fakeGet)
     client.getChain(
         "VOO",
         expirationDateGte="2027-06-01",
@@ -150,7 +149,9 @@ def test_chainFiltersForwarded(client, monkeypatch):
     assert seen["params"]["type"] == "call"
 
 
-def test_nullGreeksBsFallback(client, monkeypatch):
+def test_nullGreeksSkipped(client, monkeypatch):
+    # No Black-Scholes fallback: null greeks.delta means the snapshot is
+    # skipped from getSnapshots results entirely.
     payload = makeSnapshotPayload(
         delta=None,
         iv=None,
@@ -160,25 +161,15 @@ def test_nullGreeksBsFallback(client, monkeypatch):
         symbol="VOO280121C00450000",
     )
     monkeypatch.setattr(
-        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+        market_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
     )
-    result = client.getSnapshots(["VOO280121C00450000"])
-    snap = result["VOO280121C00450000"]
-
-    mid = (285.10 + 286.90) / 2
-    days = (snap.expiry - datetime.now(timezone.utc).date()).days
-    t = days / 365.0
-    expectedIv = impliedVolatility(mid, 700.0, 450.0, t)
-    expectedDelta = callDelta(700.0, 450.0, t, expectedIv)
-    assert snap.iv == pytest.approx(expectedIv, rel=1e-6)
-    assert snap.delta == pytest.approx(expectedDelta, abs=1e-4)
-    assert snap.delta > 0.85  # deep ITM sanity
+    assert client.getSnapshots(["VOO280121C00450000"]) == {}
 
 
 def test_bidZeroRejected(client, monkeypatch):
     payload = makeSnapshotPayload(bp=0, ap=1.0)
     monkeypatch.setattr(
-        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+        market_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
     )
     assert client.getSnapshots(["VOO260904C00680000"]) == {}
 
@@ -187,7 +178,7 @@ def test_staleQuoteRejected(client, monkeypatch):
     stale = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat().replace("+00:00", "Z")
     payload = makeSnapshotPayload(ts=stale)
     monkeypatch.setattr(
-        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+        market_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
     )
     assert client.getSnapshots(["VOO260904C00680000"]) == {}
 
@@ -195,7 +186,7 @@ def test_staleQuoteRejected(client, monkeypatch):
 @pytest.mark.parametrize("status", [401, 429, 500])
 def test_httpErrorsSanitized(client, monkeypatch, status):
     monkeypatch.setattr(
-        options_data.requests,
+        market_data.requests,
         "get",
         lambda *a, **k: FakeResponse(
             status_code=status, json_data={"message": "unauthorized"}, reason="Unauthorized"
@@ -237,7 +228,7 @@ def test_transportErrorSanitized(client, monkeypatch):
     def fakeGet(*a, **k):
         raise requests.ConnectionError("DNS failure: data.alpaca.markets unreachable")
 
-    monkeypatch.setattr(options_data.requests, "get", fakeGet)
+    monkeypatch.setattr(market_data.requests, "get", fakeGet)
     with pytest.raises(AlpacaApiError) as excInfo:
         client.getSnapshots(["VOO260904C00680000"])
     assert excInfo.value.statusCode == 0
@@ -252,7 +243,7 @@ def test_missingQuoteTimestampSkipped(client, monkeypatch):
     payload = makeSnapshotPayload()
     payload["VOO260904C00680000"]["latestQuote"].pop("t")
     monkeypatch.setattr(
-        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+        market_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
     )
     assert client.getSnapshots(["VOO260904C00680000"]) == {}
 
@@ -260,7 +251,7 @@ def test_missingQuoteTimestampSkipped(client, monkeypatch):
 def test_malformedQuoteTimestampSkipped(client, monkeypatch):
     payload = makeSnapshotPayload(ts="not-a-timestamp")
     monkeypatch.setattr(
-        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+        market_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
     )
     assert client.getSnapshots(["VOO260904C00680000"]) == {}
 
@@ -277,44 +268,3 @@ def test_invalidUnderlyingRootRejected(root):
 def test_sixCharRootAccepted():
     contract = parseOccSymbol("ABCDEF260904C00680000")
     assert contract.underlying == "ABCDEF"
-
-
-# --- _fallbackDelta branches: expired contract and missing underlying price ---
-
-
-def test_expiredContractNullGreeksIntrinsicDeltaITM(client, monkeypatch):
-    # Expiry in the past, null greeks, strike < spot -> intrinsic delta 1.0
-    payload = makeSnapshotPayload(
-        delta=None, iv=None, bp=250.0, ap=252.0, underlyingPrice=700.0,
-        symbol="VOO250904C00450000",  # expired 2025-09-04
-    )
-    monkeypatch.setattr(
-        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
-    )
-    snap = client.getSnapshots(["VOO250904C00450000"])["VOO250904C00450000"]
-    assert snap.delta == 1.0
-    assert snap.iv == 0.0  # nothing to solve for
-
-
-def test_expiredContractNullGreeksIntrinsicDeltaOTM(client, monkeypatch):
-    # Same, but strike > spot -> intrinsic delta 0.0; no crash either way
-    payload = makeSnapshotPayload(
-        delta=None, iv=None, bp=0.05, ap=0.15, underlyingPrice=700.0,
-        symbol="VOO250904C00900000",  # expired, strike 900
-    )
-    monkeypatch.setattr(
-        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
-    )
-    snap = client.getSnapshots(["VOO250904C00900000"])["VOO250904C00900000"]
-    assert snap.delta == 0.0
-
-
-def test_nullGreeksNoUnderlyingPriceRaisesNamingSymbol(client, monkeypatch):
-    payload = makeSnapshotPayload(
-        delta=None, iv=None, underlyingPrice=None, symbol="VOO280121C00450000"
-    )
-    monkeypatch.setattr(
-        options_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
-    )
-    with pytest.raises(AlpacaApiError, match="VOO280121C00450000"):
-        client.getSnapshots(["VOO280121C00450000"])

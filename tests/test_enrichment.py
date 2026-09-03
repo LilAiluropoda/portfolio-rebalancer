@@ -1,6 +1,7 @@
 import pytest
 
-from main import CASH_TYPE, enrichPositions
+from constants import CASH_TYPE
+from main import enrichPositions
 from conftest import (
     FakeOptionSource,
     FakePriceSource,

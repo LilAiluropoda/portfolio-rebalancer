@@ -8,8 +8,8 @@ from datetime import date, datetime
 
 import polars as pl
 
-from main import PriceDataSource, normalizePositions, validateInputs
-from options_data import OptionQuoteSource, OptionSnapshot
+from main import normalizePositions, validateInputs
+from market_data import OptionQuoteSource, OptionSnapshot, PriceDataSource
 
 TIMESTAMP = "2026-08-04"
 DEFAULT_EXPIRY = date(2027, 1, 15)
