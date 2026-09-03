@@ -1,7 +1,7 @@
 ---
 title: "feat: LEAPS lifecycle leverage via stock replacement"
 type: feat
-status: active
+status: completed
 date: 2026-09-01
 deepened: 2026-09-01
 origin: docs/brainstorms/2026-09-01-leaps-lifecycle-leverage-requirements.md

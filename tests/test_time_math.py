@@ -5,7 +5,7 @@ from datetime import date
 from main import ROLL_MONTHS_THRESHOLD, addMonths, monthsBetween
 
 
-# --- monthsBetween: whole calendar months, floor semantics ---
+# --- monthsBetween: whole elapsed months, day-aware floor semantics ---
 
 
 def test_months_between_exact_twelve():
@@ -13,8 +13,27 @@ def test_months_between_exact_twelve():
 
 
 def test_months_between_eleven_months_plus_days():
-    # 2026-09-02 -> 2027-08-31 is 11 whole months + 29 days -> still 11
+    # 2026-09-02 -> 2027-08-31: later day (31) >= earlier day (2) -> 11 whole months
     assert monthsBetween(date(2027, 8, 31), date(2026, 9, 2)) == 11
+
+
+def test_months_between_day_adjustment_kicks_in_when_target_day_earlier():
+    # 2026-09-02 -> 2027-08-01: only 10 whole months elapsed on Aug 1
+    # (the 11th completes on Aug 2) -> 10, not 11
+    assert monthsBetween(date(2027, 8, 1), date(2026, 9, 2)) == 10
+
+
+def test_months_between_day_adjustment_jan_15_examples():
+    # Jan 15 -> Dec 14: one day short of 11 whole months
+    assert monthsBetween(date(2026, 12, 14), date(2026, 1, 15)) == 10
+    # Jan 15 -> Dec 15: exactly 11 whole months
+    assert monthsBetween(date(2026, 12, 15), date(2026, 1, 15)) == 11
+
+
+def test_months_between_add_months_round_trip_is_exact():
+    today = date(2026, 9, 2)
+    assert monthsBetween(addMonths(today, 12), today) == 12  # same day-of-month, no clamp
+    assert monthsBetween(addMonths(today, 21), today) == 21
 
 
 def test_months_between_same_month_is_zero():

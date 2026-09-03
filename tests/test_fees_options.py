@@ -16,6 +16,7 @@ def makeOptionTrade(contracts: float, premium: float) -> Trade:
         sharesChange=contracts,
         marketValueChange=contracts * premium * 100,
         timestamp=datetime(2026, 9, 1),
+        quantityKind="contract",
     )
 
 

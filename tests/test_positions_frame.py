@@ -159,3 +159,29 @@ def test_equity_weights_must_sum_to_100():
 
     with pytest.raises(ValueError, match="did not add up to 100"):
         validateInputs(frame, leverage=1.5, liquidateLeaps=False)
+
+
+def test_option_negative_shares_rejected():
+    frame = buildFrame(
+        [
+            equityRow("VOO", 35, 100, sleeve="true"),
+            optionRow("VOO270115C00450000", -2),
+            cashRow(1000),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="VOO270115C00450000.*positive whole number"):
+        validateInputs(frame, leverage=1.5, liquidateLeaps=False)
+
+
+def test_option_fractional_shares_rejected():
+    frame = buildFrame(
+        [
+            equityRow("VOO", 35, 100, sleeve="true"),
+            optionRow("VOO270115C00450000", 1.5),
+            cashRow(1000),
+        ]
+    )
+
+    with pytest.raises(ValueError, match="VOO270115C00450000.*positive whole number"):
+        validateInputs(frame, leverage=1.5, liquidateLeaps=False)
