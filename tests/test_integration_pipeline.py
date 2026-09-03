@@ -16,24 +16,22 @@ from main import (
     Trade,
 )
 from conftest import (
+    CHAIN_LATE_EXPIRY,
     FakeOptionSource,
     FakePriceSource,
+    HELD_KEEP_EXPIRY,
+    HELD_ROLL_EXPIRY,
+    TODAY,
     cash,
     equity,
     frameWith,
     makeSnapshot,
+    occ,
     option,
+    tradesBySymbol,
 )
 
-TODAY = datetime(2026, 9, 2, 10, 0, 0)
 SPOT = 700.0
-HELD_ROLL_EXPIRY = date(2027, 6, 18)   # 9 months out -> roll window
-HELD_KEEP_EXPIRY = date(2028, 5, 18)   # 20 months out -> keep
-CHAIN_LATE_EXPIRY = date(2028, 6, 19)  # >= MIN_EXPIRY_MONTHS
-
-
-def occ(root: str, expiry: date, strike: float) -> str:
-    return f"{root}{expiry:%y%m%d}C{int(strike * 1000):08d}"
 
 
 def runPipeline(rows, optionSource, leverage=1.5, designated="VOO", prices=None):
@@ -45,10 +43,6 @@ def runPipeline(rows, optionSource, leverage=1.5, designated="VOO", prices=None)
     platform = TradingPlatformFactory.getTradingPlatform("futubullUS")
     trades = executeTrades(planned, enriched, platform)
     return enriched, sleeveTable, trades
-
-
-def tradesBySymbol(trades):
-    return {t.instrumentId: t for t in trades}
 
 
 # --- (g) R20 fee invariant: fees live solely in the cash residual row ---

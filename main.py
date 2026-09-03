@@ -32,6 +32,11 @@ KIND_EQUITY = "equity"
 KIND_CASH = "cash"
 KIND_OPTION = "option"
 
+# Canonical quantity kinds (quantityKind vocabulary)
+QTY_SHARE = "share"
+QTY_CONTRACT = "contract"
+QTY_CASH = "cash"
+
 # Contract lifecycle / selection constants (R9-R13, R21)
 MIN_EXPIRY_MONTHS = 21
 ROLL_MONTHS_THRESHOLD = 12
@@ -44,11 +49,15 @@ class PriceDataSource(ABC):
     def getClosingPrice(self, ticker: str, date: datetime) -> float:
         pass
 
+    def getClosingPrices(self, tickers: list[str], date: datetime) -> dict[str, float]:
+        """Batched closing prices; default delegates per-ticker."""
+        return {ticker: self.getClosingPrice(ticker, date) for ticker in tickers}
+
 class YFinancePriceData(PriceDataSource):
     def getClosingPrice(self, ticker: str, date: datetime):
         try:
             if ticker == "USD":
-                return 1.0 
+                return 1.0
 
             instrumentQuote = yf.download(
                 ticker, start=date, end=date + timedelta(days=1), progress=False
@@ -62,6 +71,32 @@ class YFinancePriceData(PriceDataSource):
 
         except Exception as e:
             raise Exception(f"Error fetching data for {ticker} on {date}: {str(e)}")
+
+    def getClosingPrices(self, tickers: list[str], date: datetime) -> dict[str, float]:
+        try:
+            prices: dict[str, float] = {t: 1.0 for t in tickers if t == "USD"}
+            fetch = [t for t in tickers if t != "USD"]
+            if not fetch:
+                return prices
+
+            instrumentQuote = yf.download(
+                tickers=fetch, start=date, end=date + timedelta(days=1), progress=False
+            )
+            if instrumentQuote.empty:
+                raise Exception(f"No data available for {fetch} on {date}")
+
+            close = instrumentQuote["Close"]
+            for ticker in fetch:
+                # Multi-ticker downloads give a (Price, Ticker) column pair;
+                # single-ticker downloads may collapse to a bare Series.
+                series = close[ticker] if hasattr(close, "columns") else close
+                if series.isna().all():
+                    raise Exception(f"No data available for {ticker} on {date}")
+                prices[ticker] = float(series.dropna().iloc[-1])
+            return prices
+
+        except Exception as e:
+            raise Exception(f"Error fetching data for {tickers} on {date}: {str(e)}")
 
 class DataSourceFactory:
     instances: dict[str, PriceDataSource] = {}
@@ -185,12 +220,12 @@ class Trade(BaseModel):
     transactionCost: float = 0
     timestamp: datetime
     underlying: str = ""
-    quantityKind: str = "share"  # "share" | "contract" | "cash"
+    quantityKind: str = QTY_SHARE  # "share" | "contract" | "cash"
     exposureChange: float = 0.0
     reason: str = ""
 
     def calcTransactionCost(self, platform: TradingPlatform)->None:
-        if self.quantityKind == "contract":
+        if self.quantityKind == QTY_CONTRACT:
             self.transactionCost = platform.calcOptionsTransactionCost(self.instrumentType, self.sharesChange, self.marketValueChange)
         else:
             self.transactionCost = platform.calcTransactionCost(self.instrumentType, self.sharesChange, self.marketValueChange)
@@ -232,18 +267,16 @@ def sizeSleeve(
 
     residualExposure = targetExposure - desiredContracts * perContractExposure
     desiredShareChange = residualExposure / spot
-    shareChange = math.floor(desiredShareChange) if desiredShareChange >= 0 else math.ceil(desiredShareChange)
-    shareChange = max(shareChange, -int(heldShares))  # never sell more than held
+    shareChange = _bestEffortInt(desiredShareChange, heldShares)
 
     achievedExposure = desiredContracts * perContractExposure + shareChange * spot
     # Signed tracking error: positive = overshoot, negative = undershoot
     trackingErrorExposure = achievedExposure - targetExposure
-    if trackingErrorExposure > 1e-9:
-        residualDirection = "overshoot"
-    elif trackingErrorExposure < -1e-9:
-        residualDirection = "undershoot"
-    else:
-        residualDirection = "on-target"
+    residualDirection = (
+        "overshoot" if trackingErrorExposure > 1e-9
+        else "undershoot" if trackingErrorExposure < -1e-9
+        else "on-target"
+    )
 
     return SleevePlan(
         contractChange=contractChange,
@@ -322,6 +355,17 @@ def monthsBetween(later: date, earlier: date) -> int:
     return months
 
 
+def _bestEffortInt(shareDelta: float, heldShares: float) -> int:
+    """Truncate toward zero; never sell more shares than held."""
+    shareChange = int(shareDelta)  # truncates toward zero
+    return max(shareChange, -int(heldShares))
+
+
+def perContractExposure(delta: float, spot: float) -> float:
+    """Delta-adjusted notional exposure of one option contract."""
+    return OPTION_MULTIPLIER * delta * spot
+
+
 def _passesLiquidityFilter(snap) -> bool:
     if snap.mid <= 0:
         return False
@@ -354,11 +398,14 @@ def selectContract(
         )
         return None, "none"
 
-    expiryFloor = addMonths(today, MIN_EXPIRY_MONTHS)
+    # One chain fetch at the roll-window (12-month) floor; the 21-month
+    # MIN_EXPIRY_MONTHS qualifying check is applied in memory.
+    chainFloor = addMonths(today, ROLL_MONTHS_THRESHOLD)
     chain = optionSource.getChain(
-        underlying, expirationDateGte=expiryFloor.isoformat(), optionType="call"
+        underlying, expirationDateGte=chainFloor.isoformat(), optionType="call"
     )
-    candidates = [s for s in chain.values() if s.expiry >= expiryFloor and _passesLiquidityFilter(s)]
+    liquid = [s for s in chain.values() if _passesLiquidityFilter(s)]
+    candidates = [s for s in liquid if s.expiry >= addMonths(today, MIN_EXPIRY_MONTHS)]
     if candidates:
         snap = _pickCandidate(candidates)
         logger.info(
@@ -367,12 +414,8 @@ def selectContract(
         )
         return snap, "selected"
 
-    # Chain-depth probe: would candidates exist without the MIN_EXPIRY_MONTHS floor?
-    probeFloor = addMonths(today, ROLL_MONTHS_THRESHOLD)
-    probeChain = optionSource.getChain(
-        underlying, expirationDateGte=probeFloor.isoformat(), optionType="call"
-    )
-    if any(s.expiry >= probeFloor and _passesLiquidityFilter(s) for s in probeChain.values()):
+    # Chain-depth check: candidates exist only below MIN_EXPIRY_MONTHS (R21)
+    if liquid:
         logger.info(
             f"[Contract Selection] {underlying}: candidates exist only below "
             f"{MIN_EXPIRY_MONTHS} months — deferring"
@@ -381,12 +424,6 @@ def selectContract(
 
     logger.info(f"[Contract Selection] {underlying}: no qualifying candidate")
     return None, "none"
-
-
-def _bestEffortInt(shareDelta: float, heldShares: float) -> int:
-    """Truncate toward zero; never sell more shares than held."""
-    shareChange = int(shareDelta)  # truncates toward zero
-    return max(shareChange, -int(heldShares))
 
 
 def planTrades(
@@ -432,7 +469,7 @@ def planTrades(
                 marketValueChange=contractChange * premiumMid * OPTION_MULTIPLIER,
                 timestamp=tradeTimestamp,
                 underlying=underlying,
-                quantityKind="contract",
+                quantityKind=QTY_CONTRACT,
                 exposureChange=contractChange * perContractExposure,
                 reason=reason,
             )
@@ -449,7 +486,7 @@ def planTrades(
                 marketValueChange=shareChange * spot,
                 timestamp=tradeTimestamp,
                 underlying=underlying,
-                quantityKind="share",
+                quantityKind=QTY_SHARE,
                 exposureChange=shareChange * spot,
                 reason=reason,
             )
@@ -462,7 +499,7 @@ def planTrades(
     ) -> None:
         # Resize sizing uses the ANCHOR row's own per-contract exposure, not the
         # sleeve average — mixed-delta sleeves would otherwise mis-size counts.
-        anchorPerContractExposure = OPTION_MULTIPLIER * anchorRow["deltaAdj"] * spot
+        anchorPerContractExposure = perContractExposure(anchorRow["deltaAdj"], spot)
         plan = sizeSleeve(
             sleeve["targetExposure"], anchorPerContractExposure, heldContracts, heldShares, spot
         )
@@ -480,14 +517,14 @@ def planTrades(
         for row in heldOptionRows:
             emitContract(
                 underlying, row["instrumentId"], -row["shares"], row["closingPrice"],
-                OPTION_MULTIPLIER * row["deltaAdj"] * spot, spot, reason,
+                perContractExposure(row["deltaAdj"], spot), spot, reason,
             )
 
     def emitSizedPlan(
         sleeve: dict, snap: OptionSnapshot, heldShares: float, spot: float,
         contractReason: str, shareReason: str,
     ) -> None:
-        perContract = OPTION_MULTIPLIER * snap.delta * spot
+        perContract = perContractExposure(snap.delta, spot)
         plan = sizeSleeve(sleeve["targetExposure"], perContract, 0, heldShares, spot)
         if plan.contractChange != 0:
             emitContract(
@@ -505,6 +542,12 @@ def planTrades(
         heldOptionRows = optionRowsByUnderlying.get(underlying, [])
         baseWeightExposure = sleeve["weight"] * totalMarketValue
         equityExposure = heldShares * spot
+
+        def emitBaseWeightShares(reason: str) -> None:
+            """Shares fallback sized to the sleeve's BASE weight (not leveraged)."""
+            shareChange = _bestEffortInt((baseWeightExposure - equityExposure) / spot, heldShares)
+            if shareChange != 0:
+                emitShares(underlying, shareChange, spot, reason)
 
         if not sleeve["isDesignated"]:
             if heldContracts > 0:
@@ -533,9 +576,7 @@ def planTrades(
             emitExitAllContracts(
                 heldOptionRows, underlying, spot, "liquidation: --liquidate-leaps",
             )
-            shareChange = _bestEffortInt((baseWeightExposure - equityExposure) / spot, heldShares)
-            if shareChange != 0:
-                emitShares(underlying, shareChange, spot, "liquidation: --liquidate-leaps")
+            emitBaseWeightShares("liquidation: --liquidate-leaps")
             continue
 
         if heldContracts == 0:
@@ -547,11 +588,7 @@ def planTrades(
                 )
             else:
                 # R13: shares fallback at base weight
-                shareChange = _bestEffortInt((baseWeightExposure - equityExposure) / spot, heldShares)
-                if shareChange != 0:
-                    emitShares(
-                        underlying, shareChange, spot, "shares fallback: no qualifying contract"
-                    )
+                emitBaseWeightShares("shares fallback: no qualifying contract")
             continue
 
         earliestRow = min(
@@ -590,9 +627,7 @@ def planTrades(
                 heldOptionRows, underlying, spot,
                 "roll: exit — no qualifying replacement",
             )
-            shareChange = _bestEffortInt((baseWeightExposure - equityExposure) / spot, heldShares)
-            if shareChange != 0:
-                emitShares(underlying, shareChange, spot, "shares fallback: roll de-lever")
+            emitBaseWeightShares("shares fallback: roll de-lever")
 
     return trades
 
@@ -686,13 +721,9 @@ def validateInputs(positionDF: pl.DataFrame, leverage: float, liquidateLeaps: bo
     return designated
 
 
-def getAvailableCash(positionEnrichedDF: pl.DataFrame) -> tuple[bool, float]:
+def getAvailableCash(positionEnrichedDF: pl.DataFrame) -> float:
     cashRows = positionEnrichedDF.filter(pl.col("kind") == KIND_CASH)
-    cashAvailable: float = (
-        cashRows.select(pl.col("marketValue").sum()).item() if len(cashRows) > 0 else 0.0
-    )
-    hasCash = len(cashRows) > 0
-    return hasCash, cashAvailable
+    return cashRows.select(pl.col("marketValue").sum()).item() if len(cashRows) > 0 else 0.0
 
 def enrichPositions(
     positionDF: pl.DataFrame,
@@ -711,19 +742,33 @@ def enrichPositions(
 
     positionDF = positionDF.with_row_index("rowIdx")
 
-    equityCashRows = positionDF.filter(pl.col("kind") != KIND_OPTION).with_columns(
-        pl.struct(["instrumentId", "timestamp", "kind"])
+    equityCashRows = positionDF.filter(pl.col("kind") != KIND_OPTION)
+    optionRows = positionDF.filter(pl.col("kind") == KIND_OPTION)
+
+    # Batched price fetches: group needed tickers by CSV timestamp (usually one
+    # date) — equity/cash rows plus option-only underlyings' spot requests —
+    # and fetch each date-group in a single call.
+    pricedTickers: dict[str, set[str]] = {}
+    for row in equityCashRows.iter_rows(named=True):
+        pricedTickers.setdefault(row["timestamp"], set()).add(row["instrumentId"])
+    equityUnderlyings = set(equityCashRows["instrumentId"].to_list())
+    for row in optionRows.iter_rows(named=True):
+        if row["underlying"] not in equityUnderlyings:
+            pricedTickers.setdefault(row["timestamp"], set()).add(row["underlying"])
+    pricesByTimestamp = {
+        ts: priceDataSource.getClosingPrices(sorted(tickers), datetime.strptime(ts, "%Y-%m-%d"))
+        for ts, tickers in pricedTickers.items()
+    }
+
+    equityCashRows = equityCashRows.with_columns(
+        pl.struct(["instrumentId", "timestamp"])
         .map_elements(
-            lambda row: priceDataSource.getClosingPrice(
-                ticker=row["instrumentId"],
-                date=datetime.strptime(row["timestamp"], "%Y-%m-%d"),
-            ),
+            lambda row: pricesByTimestamp[row["timestamp"]][row["instrumentId"]],
             return_dtype=pl.Float64,
         )
         .alias("closingPrice"),
     )
 
-    optionRows = positionDF.filter(pl.col("kind") == KIND_OPTION)
     if optionRows.height > 0:
         if optionSource is None:
             raise Exception("Option rows present but no option data source was provided")
@@ -762,19 +807,16 @@ def enrichPositions(
     logger.info(f"[Position Enrichment] Total market value: {totalMarketValue}")
 
     # Underlying spots for exposure: equity rows price themselves; option rows
-    # price their underlying. Option-only sleeves fetch the spot via the equity
-    # source at the CSV timestamp (single fetch, cached).
+    # price their underlying. Option-only sleeves' spots come from the same
+    # batched fetch above (cached per underlying).
     spotByUnderlying = {
-        row["underlying"]: row["closingPrice"]
-        for row in positionEnrichedDF.filter(pl.col("kind") != KIND_OPTION).iter_rows(named=True)
+        row["instrumentId"]: row["closingPrice"]
+        for row in equityCashRows.iter_rows(named=True)
     }
-    for optionRow in positionEnrichedDF.filter(pl.col("kind") == KIND_OPTION).iter_rows(named=True):
+    for optionRow in optionRows.iter_rows(named=True):
         underlying = optionRow["underlying"]
         if underlying not in spotByUnderlying:
-            spotByUnderlying[underlying] = priceDataSource.getClosingPrice(
-                ticker=underlying,
-                date=datetime.strptime(optionRow["timestamp"], "%Y-%m-%d"),
-            )
+            spotByUnderlying[underlying] = pricesByTimestamp[optionRow["timestamp"]][underlying]
 
     positionEnrichedDF = positionEnrichedDF.with_columns(
         pl.col("underlying").replace_strict(spotByUnderlying, default=None).alias("underlyingSpot"),
@@ -858,12 +900,12 @@ def executeTrades(
     """
     logger.info("[Trade Execution] Trade execution started")
 
-    (_, cashAvailable) = getAvailableCash(positionEnrichedDF)
+    cashAvailable = getAvailableCash(positionEnrichedDF)
     logger.info(f"[Trade Execution] Available cash before rebalancing: {cashAvailable:.2f}")
 
     # Waterfall order: contract sells -> equity sells -> contract buys -> equity buys
     def orderKey(t: Trade) -> int:
-        if t.quantityKind == "contract":
+        if t.quantityKind == QTY_CONTRACT:
             return 0 if t.sharesChange < 0 else 2
         return 1 if t.sharesChange < 0 else 3
 
@@ -871,7 +913,7 @@ def executeTrades(
     executed: list[Trade] = []
 
     for trade in sorted(plannedTrades, key=orderKey):
-        if trade.quantityKind == "share" and trade.sharesChange > 0:
+        if trade.quantityKind == QTY_SHARE and trade.sharesChange > 0:
             # Equity buy — constrained by available cash (incl. cash freed from sells)
             maxSharesBuyable = int((cashAvailable - netCashUsed) / trade.price)
             if maxSharesBuyable <= 0:
@@ -921,7 +963,7 @@ def executeTrades(
                 sharesChange=cashMovement,
                 marketValueChange=cashMovement,
                 timestamp=executed[-1].timestamp if executed else datetime.now(),
-                quantityKind="cash",
+                quantityKind=QTY_CASH,
                 reason="cash residual: premium + shares − fees",
             )
         )
@@ -1037,11 +1079,11 @@ def buildExposureReport(
         exposureChangeByUnderlying[t.underlying] = (
             exposureChangeByUnderlying.get(t.underlying, 0.0) + t.exposureChange
         )
-        if t.quantityKind == "share":
+        if t.quantityKind == QTY_SHARE:
             shareChangeByUnderlying[t.underlying] = (
                 shareChangeByUnderlying.get(t.underlying, 0.0) + t.sharesChange
             )
-        elif t.quantityKind == "contract":
+        elif t.quantityKind == QTY_CONTRACT:
             contractChangeByUnderlying[t.underlying] = (
                 contractChangeByUnderlying.get(t.underlying, 0.0) + t.sharesChange
             )

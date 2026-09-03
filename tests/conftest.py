@@ -14,6 +14,21 @@ from options_data import OptionQuoteSource, OptionSnapshot
 TIMESTAMP = "2026-08-04"
 DEFAULT_EXPIRY = date(2027, 1, 15)
 
+# Shared lifecycle-test reference constants (planTrades reference date and
+# held/chain contract dates relative to it)
+TODAY = datetime(2026, 9, 2, 10, 0, 0)
+HELD_ROLL_EXPIRY = date(2027, 6, 18)   # 9 months out -> roll window
+HELD_KEEP_EXPIRY = date(2028, 5, 18)   # 20 months out -> keep
+CHAIN_LATE_EXPIRY = date(2028, 6, 19)  # >= MIN_EXPIRY_MONTHS
+
+
+def occ(root: str, expiry: date, strike: float) -> str:
+    return f"{root}{expiry:%y%m%d}C{int(strike * 1000):08d}"
+
+
+def tradesBySymbol(trades):
+    return {t.instrumentId: t for t in trades}
+
 
 class FakePriceSource(PriceDataSource):
     """Canned prices; records every ticker fetched (spot-on-demand assertions)."""

@@ -2,13 +2,13 @@ import logging
 import os
 import re
 from abc import ABC, abstractmethod
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 import requests
 from dotenv import load_dotenv
 from pydantic import BaseModel
 
-from black_scholes import call_delta, implied_volatility
+from black_scholes import callDelta, impliedVolatility
 
 _logger = logging.getLogger("Portfolio Rebalancer")
 
@@ -124,6 +124,7 @@ class OptionQuoteSource(ABC):
 
 ALPACA_DATA_BASE_URL = "https://data.alpaca.markets"
 _MAX_SNAPSHOT_SYMBOLS = 100
+_MAX_CHAIN_PAGES = 50
 
 
 class AlpacaOptionData(OptionQuoteSource):
@@ -198,7 +199,15 @@ class AlpacaOptionData(OptionQuoteSource):
 
         snapshots: dict[str, OptionSnapshot] = {}
         pageToken: str | None = None
+        pagesFetched = 0
         while True:
+            pagesFetched += 1
+            if pagesFetched > _MAX_CHAIN_PAGES:
+                raise AlpacaApiError(
+                    0,
+                    f"getChain for {underlying} exceeded {_MAX_CHAIN_PAGES} pages — "
+                    "aborting to avoid an unbounded pagination loop",
+                )
             pageParams = dict(params)
             if pageToken is not None:
                 pageParams["page_token"] = pageToken
@@ -234,7 +243,7 @@ class AlpacaOptionData(OptionQuoteSource):
         except (TypeError, ValueError):
             _logger.warning("Skipping %s: missing or unparseable quote timestamp (%r)", symbol, rawTs)
             return None
-        if quoteTimestamp.date() != datetime.now().astimezone().date():
+        if quoteTimestamp.date() != datetime.now(timezone.utc).date():
             _logger.warning(
                 "Skipping %s: quote timestamp %s is not same-day", symbol, quote["t"]
             )
@@ -274,7 +283,7 @@ class AlpacaOptionData(OptionQuoteSource):
                 f"Cannot compute Black-Scholes fallback delta for {contract.symbol}: "
                 "greeks null and no underlying price in snapshot",
             )
-        timeToExpiry = (contract.expiry - datetime.now().astimezone().date()).days / 365.0
+        timeToExpiry = (contract.expiry - datetime.now(timezone.utc).date()).days / 365.0
         if timeToExpiry <= 0:
             _logger.warning(
                 "Contract %s has expired; fallback delta treated as intrinsic",
@@ -284,8 +293,8 @@ class AlpacaOptionData(OptionQuoteSource):
             delta = 1.0 if contract.strike < spot else 0.0
             return delta, iv if iv is not None else 0.0
         if iv is None:
-            iv = implied_volatility(mid, spot, contract.strike, timeToExpiry)
-        delta = call_delta(spot, contract.strike, timeToExpiry, iv)
+            iv = impliedVolatility(mid, spot, contract.strike, timeToExpiry)
+        delta = callDelta(spot, contract.strike, timeToExpiry, iv)
         return delta, iv
 
 

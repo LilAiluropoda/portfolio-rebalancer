@@ -12,31 +12,27 @@ from main import (
     sizeSleeve,
 )
 from conftest import (
+    CHAIN_LATE_EXPIRY,
     FakeOptionSource,
     FakePriceSource,
+    HELD_KEEP_EXPIRY,
+    HELD_ROLL_EXPIRY,
+    TODAY,
     cash,
     equity,
     frameWith,
     makeSnapshot,
+    occ,
     option,
+    tradesBySymbol,
 )
 
-TODAY = datetime(2026, 9, 2, 10, 0, 0)  # planTrades reference date
-
-# Held / chain contract dates relative to TODAY (2026-09-02)
-HELD_ROLL_EXPIRY = date(2027, 6, 18)      # 9 months out -> roll window
-HELD_KEEP_EXPIRY = date(2028, 5, 18)      # 20 months out -> keep
-CHAIN_LATE_EXPIRY = date(2028, 6, 19)     # 22 months out -> >= MIN_EXPIRY_MONTHS
 CHAIN_NEAR_EXPIRY = date(2028, 1, 21)     # within >= 21-month floor
 CHAIN_DEFERRED_EXPIRY = date(2027, 12, 17)  # 15 months out -> below floor, above 12
 
 HELD_SYMBOL = "VOO270618C00450000"
 SPOT = 700.0
 PER_CONTRACT_HELD = 100 * 0.85 * SPOT  # 59,500
-
-
-def occ(root: str, expiry: date, strike: float) -> str:
-    return f"{root}{expiry:%y%m%d}C{int(strike * 1000):08d}"
 
 
 def planFor(rows, optionSource, leverage=1.5, designated="VOO", liquidateLeaps=False):
@@ -49,10 +45,6 @@ def planFor(rows, optionSource, leverage=1.5, designated="VOO", liquidateLeaps=F
     return planTrades(
         enriched, table, designated, leverage, optionSource, TODAY, liquidateLeaps=liquidateLeaps
     )
-
-
-def tradesBySymbol(trades):
-    return {t.instrumentId: t for t in trades}
 
 
 # --- AE1: held contract inside the roll window -> sell + rule-selected replacement ---
@@ -192,7 +184,7 @@ def test_empty_chain_treated_as_no_candidate_fallback():
         ],
         source,
     )
-    assert len(source.chainCalls) == 2  # floor query + no-floor probe, both empty
+    assert len(source.chainCalls) == 1  # single 12-month-floor query, empty chain
     assert all(t.quantityKind == "share" for t in trades)
     assert any(t.reason == "shares fallback: no qualifying contract" for t in trades)
 
@@ -250,7 +242,7 @@ def test_roll_deferred_when_candidates_only_below_floor():
         ],
         source,
     )
-    assert len(source.chainCalls) == 2  # floor query empty, 12-month probe found depth
+    assert len(source.chainCalls) == 1  # one 12-month-floor query; depth found only below the 21-month floor
     contractTrades = [t for t in trades if t.quantityKind == "contract"]
     # treated as keep: resize held (2 -> 1), no replacement bought
     assert len(contractTrades) == 1

@@ -6,7 +6,7 @@ import pytest
 
 import options_data
 import requests
-from black_scholes import call_delta, implied_volatility
+from black_scholes import callDelta, impliedVolatility
 from options_data import (
     AlpacaApiError,
     AlpacaConfigError,
@@ -112,6 +112,22 @@ def test_chainPagination(client, monkeypatch):
     assert all(p["feed"] == "indicative" and p["limit"] == 1000 for p in requestsMade)
 
 
+def test_chainPaginationCap(client, monkeypatch):
+    # Endless fresh page tokens must hit the 50-page guard, not loop forever.
+    calls = {"n": 0}
+
+    def fakeGet(url, headers=None, params=None, timeout=None):
+        calls["n"] += 1
+        payload = dict(makeSnapshotPayload())
+        payload["next_page_token"] = f"page{calls['n'] + 1}"
+        return FakeResponse(json_data=payload)
+
+    monkeypatch.setattr(options_data.requests, "get", fakeGet)
+    with pytest.raises(AlpacaApiError, match="50 pages"):
+        client.getChain("VOO")
+    assert calls["n"] == 50
+
+
 def test_chainFiltersForwarded(client, monkeypatch):
     seen = {}
 
@@ -152,8 +168,8 @@ def test_nullGreeksBsFallback(client, monkeypatch):
     mid = (285.10 + 286.90) / 2
     days = (snap.expiry - datetime.now(timezone.utc).date()).days
     t = days / 365.0
-    expectedIv = implied_volatility(mid, 700.0, 450.0, t)
-    expectedDelta = call_delta(700.0, 450.0, t, expectedIv)
+    expectedIv = impliedVolatility(mid, 700.0, 450.0, t)
+    expectedDelta = callDelta(700.0, 450.0, t, expectedIv)
     assert snap.iv == pytest.approx(expectedIv, rel=1e-6)
     assert snap.delta == pytest.approx(expectedDelta, abs=1e-4)
     assert snap.delta > 0.85  # deep ITM sanity

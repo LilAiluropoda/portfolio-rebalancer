@@ -77,4 +77,4 @@ uv run python main.py --portfolioCSV data/portfolio_example_leaps.csv --leverage
 - Fees are computed per trade row under the Futu HK US options/equity schedule and are paid from the cash residual; the exposure report shows achieved leverage, per-sleeve tracking error, and total fees each run.
 
 ## Example Screenshot
-![Example Screenshot](./doc/script_run_example.png)
+![Example Screenshot](./docs/screenshots/script_run_example.png)
