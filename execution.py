@@ -5,7 +5,7 @@ from datetime import datetime
 
 import polars as pl
 
-from constants import CASH_TYPE, KIND_CASH, QTY_CASH, QTY_CONTRACT, QTY_SHARE
+from constants import CASH_TYPE, KIND_CASH, KIND_EQUITY, KIND_OPTION, QTY_CASH, QTY_CONTRACT, QTY_SHARE
 from fees import TradingPlatform
 from planning import Trade, kindForInstrumentType
 
@@ -146,6 +146,7 @@ def applyTrades(positionEnrichedDF: pl.DataFrame, trades: list[Trade]) -> pl.Dat
         "kindTrade": pl.String,
         "sharesChange": pl.Float64,
         "marketValueChange": pl.Float64,
+        "exposureChange": pl.Float64,
         "closingPriceTrade": pl.Float64,
     }
     tradesDF = pl.DataFrame(
@@ -156,6 +157,7 @@ def applyTrades(positionEnrichedDF: pl.DataFrame, trades: list[Trade]) -> pl.Dat
             "kindTrade": kindForInstrumentType(t.instrumentType),
             "sharesChange": t.sharesChange,
             "marketValueChange": t.marketValueChange,
+            "exposureChange": t.exposureChange,
             "closingPriceTrade": t.price,
         } for t in trades],
         schema=tradesSchema,
@@ -166,6 +168,7 @@ def applyTrades(positionEnrichedDF: pl.DataFrame, trades: list[Trade]) -> pl.Dat
     tradesDF = tradesDF.group_by("instrumentId").agg(
         pl.col("sharesChange").sum(),
         pl.col("marketValueChange").sum(),
+        pl.col("exposureChange").sum(),
         pl.col("instrumentTypeTrade").first(),
         pl.col("underlyingTrade").first(),
         pl.col("kindTrade").first(),
@@ -195,6 +198,12 @@ def applyTrades(positionEnrichedDF: pl.DataFrame, trades: list[Trade]) -> pl.Dat
                 pl.coalesce(pl.col("marketValue"), pl.lit(0.0)) +
                 pl.coalesce(pl.col("marketValueChange"), pl.lit(0.0))
             ).alias("marketValue"),
+            # Post-trade monetized-delta exposure (equity delta = 1; contracts
+            # carry their delta via the trade's exposureChange delta)
+            (
+                pl.coalesce(pl.col("exposure"), pl.lit(0.0)) +
+                pl.coalesce(pl.col("exposureChange"), pl.lit(0.0))
+            ).alias("exposure"),
             # Instrument type: prefer position side, fall back to trade side
             pl.coalesce(pl.col("instrumentType"), pl.col("instrumentTypeTrade")).alias("instrumentType"),
             # Closing price: prefer position side, coalesce the trade price
@@ -212,6 +221,7 @@ def applyTrades(positionEnrichedDF: pl.DataFrame, trades: list[Trade]) -> pl.Dat
             "kind",
             "shares",
             "marketValue",
+            "exposure",
             "targetRatioPct",
             "closingPrice",
         ])
@@ -261,6 +271,7 @@ def buildExposureReport(
             "heldContracts",
             "currentExposure",
             "targetExposure",
+            "weight",
             "isDesignated",
         ]
     ).with_columns(
@@ -274,16 +285,15 @@ def buildExposureReport(
     ).with_columns(
         (pl.col("achievedExposure") - pl.col("targetExposure")).alias("trackingError"),
     ).with_columns(
-        # Ratio = monetized-delta share of the whole portfolio's monetized delta,
-        # computed separately for achieved and target so they compare directly
+        # achievedRatioPct = monetized-delta share of the whole portfolio's
+        # achieved monetized delta. targetRatioPct is the INPUT weight
+        # passthrough (equity-row weight x 100; option-only sleeves 0) — NOT
+        # a share of total target exposure, so it reads verbatim like the CSV.
         pl.when(pl.col("achievedExposure").sum() != 0)
         .then(pl.col("achievedExposure") / pl.col("achievedExposure").sum() * 100)
         .otherwise(0.0)
         .alias("achievedRatioPct"),
-        pl.when(pl.col("targetExposure").sum() != 0)
-        .then(pl.col("targetExposure") / pl.col("targetExposure").sum() * 100)
-        .otherwise(0.0)
-        .alias("targetRatioPct"),
+        (pl.col("weight") * 100.0).alias("targetRatioPct"),
     ).select([
         "underlying",
         "postShares",
@@ -317,24 +327,62 @@ def printExposureReport(reportDF: pl.DataFrame, achievedLeverage: float, totalFe
     )
 
 
+def buildExpectedPositions(positionPostTradeDF: pl.DataFrame) -> pl.DataFrame:
+    """
+    Per-UNDERLYING expected position table: stock and contract rows of the
+    same underlying aggregate into one sleeve row after trades.
+      - postMarketValue: cash value of the sleeve (sum of marketValue)
+      - postExposure: monetized delta (sum of exposure)
+      - targetRatioPct: the INPUT weight passthrough from the equity row
+        (0 for option-only sleeves / trade-introduced underlyings)
+      - achievedRatioPct: sleeve postExposure / total postExposure x 100
+    """
+    return (
+        positionPostTradeDF.filter(pl.col("kind") != KIND_CASH)
+        .group_by("underlying")
+        .agg(
+            pl.when(pl.col("kind") == KIND_EQUITY)
+            .then(pl.col("shares")).otherwise(0.0)
+            .sum().alias("postShares"),
+            pl.when(pl.col("kind") == KIND_OPTION)
+            .then(pl.col("shares")).otherwise(0.0)
+            .sum().alias("postContracts"),
+            pl.col("marketValue").sum().alias("postMarketValue"),
+            pl.col("exposure").sum().alias("postExposure"),
+            pl.when(pl.col("kind") == KIND_EQUITY)
+            .then(pl.col("targetRatioPct")).otherwise(0.0)
+            .sum().alias("targetRatioPct"),
+        )
+        .with_columns(
+            pl.when(pl.col("postExposure").sum() != 0)
+            .then(pl.col("postExposure") / pl.col("postExposure").sum() * 100)
+            .otherwise(0.0)
+            .alias("achievedRatioPct"),
+        )
+        .sort("postMarketValue", descending=True)
+    )
+
+
 def printExpectedPositions(positionPostTradeDF: pl.DataFrame) -> None:
-    """Per-instrument holdings after trades. Exposure ratios live in the
-    exposure report, where a sleeve's shares + contracts combine correctly."""
+    """Per-underlying expected holdings after trades: market value (cash) and
+    exposure (monetized delta) side by side, plus input weights verbatim."""
     totalMarketValue = positionPostTradeDF["marketValue"].sum()
     logger.info(
-        f"[Post Trade Analysis] Total market value after trades: "
+        f"[Expected Position] Total market value after trades: "
         f"{totalMarketValue:.2f}"
     )
 
-    logger.info("[Post Trade Analysis] Expected positions after trades:")
+    logger.info("[Expected Position] Expected positions after trades (per underlying):")
 
-    positionPostTradeDF.select([
-        "instrumentId",
-        "instrumentType",
-        "shares",
-        "marketValue",
-        "closingPrice",
-    ]).sort("marketValue", descending=True).show(
+    buildExpectedPositions(positionPostTradeDF).select([
+        "underlying",
+        "postShares",
+        "postContracts",
+        "postMarketValue",
+        "postExposure",
+        "targetRatioPct",
+        "achievedRatioPct",
+    ]).show(
         limit=None,
         tbl_hide_dataframe_shape=True,
         tbl_column_data_type_inline=True,

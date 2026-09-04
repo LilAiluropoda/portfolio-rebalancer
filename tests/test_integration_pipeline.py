@@ -5,6 +5,7 @@ import pytest
 from constants import CASH_TYPE, OPTION_TYPE
 from execution import (
     applyTrades,
+    buildExpectedPositions,
     buildExposureReport,
     executeTrades,
     printExposureReport,
@@ -180,6 +181,35 @@ def test_mixed_end_to_end_fees_cash_and_leverage():
     assert voo["achievedExposure"] == pytest.approx(119000)
     assert voo["trackingError"] == pytest.approx(119000 - 104989.5)
     assert voo["isDesignated"]
+
+    # Ratio semantics: targetRatioPct is the INPUT weight verbatim (55/45),
+    # NOT the share of total target exposure
+    ura = {r["underlying"]: r for r in report.iter_rows(named=True)}["URA"]
+    assert voo["targetRatioPct"] == pytest.approx(55.0)
+    assert ura["targetRatioPct"] == pytest.approx(45.0)
+    # achievedRatioPct = sleeve achievedExposure / total achievedExposure x 100
+    assert voo["achievedRatioPct"] == pytest.approx(119000 / 164000 * 100)
+    assert ura["achievedRatioPct"] == pytest.approx(45000 / 164000 * 100)
+
+    # Expected-position table: per-underlying aggregation of stock + contract rows
+    post = applyTrades(enriched, trades)
+    expectedPositions = {
+        r["underlying"]: r for r in buildExpectedPositions(post).iter_rows(named=True)
+    }
+    expVoo = expectedPositions["VOO"]
+    assert expVoo["postShares"] == 0
+    assert expVoo["postContracts"] == 2
+    assert expVoo["postMarketValue"] == pytest.approx(2 * 24.22 * 100)
+    assert expVoo["postExposure"] == pytest.approx(119000)
+    assert expVoo["targetRatioPct"] == pytest.approx(55.0)
+    assert expVoo["achievedRatioPct"] == pytest.approx(119000 / 164000 * 100)
+    expUra = expectedPositions["URA"]
+    assert expUra["postShares"] == pytest.approx(2133 - 633)
+    assert expUra["postContracts"] == 0
+    assert expUra["postExposure"] == pytest.approx(45000)
+    assert expUra["targetRatioPct"] == pytest.approx(45.0)
+    # Cash row is excluded from the underlying table
+    assert "USD" not in expectedPositions
 
 
 # --- (b) AE1 / AE3 at pipeline level ---
