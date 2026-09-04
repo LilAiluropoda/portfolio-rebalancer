@@ -175,12 +175,25 @@ def test_bidZeroRejected(client, monkeypatch):
 
 
 def test_staleQuoteRejected(client, monkeypatch):
-    stale = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat().replace("+00:00", "Z")
+    # Beyond the max-age window (5 days) — e.g. a week-old illiquid quote
+    stale = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace("+00:00", "Z")
     payload = makeSnapshotPayload(ts=stale)
     monkeypatch.setattr(
         market_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
     )
     assert client.getSnapshots(["VOO260904C00680000"]) == {}
+
+
+def test_previousSessionCloseQuoteAccepted(client, monkeypatch):
+    # The freshest quote for anyone outside US market hours is the previous
+    # session's close — an age-window guard must accept it
+    lastClose = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat().replace("+00:00", "Z")
+    payload = makeSnapshotPayload(ts=lastClose)
+    monkeypatch.setattr(
+        market_data.requests, "get", lambda *a, **k: FakeResponse(json_data={"snapshots": payload})
+    )
+    snapshots = client.getSnapshots(["VOO260904C00680000"])
+    assert "VOO260904C00680000" in snapshots
 
 
 @pytest.mark.parametrize("status", [401, 429, 500])
@@ -202,6 +215,8 @@ def test_httpErrorsSanitized(client, monkeypatch, status):
 
 
 def test_missingEnvKeyNamesVariable(monkeypatch):
+    # Neutralize dotenv so the developer's real .env cannot satisfy the keys
+    monkeypatch.setattr(market_data, "load_dotenv", lambda *args, **kwargs: False)
     monkeypatch.delenv("APCA_API_KEY_ID", raising=False)
     monkeypatch.delenv("APCA_API_SECRET_KEY", raising=False)
     with pytest.raises(AlpacaConfigError, match="APCA_API_KEY_ID"):

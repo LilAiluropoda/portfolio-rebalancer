@@ -29,7 +29,6 @@ MIN_EXPIRY_MONTHS = 21
 ROLL_MONTHS_THRESHOLD = 12
 TARGET_DELTA = 0.85
 MAX_REL_SPREAD = 0.10
-MIN_DAILY_VOLUME = 1.0
 
 
 class Trade(BaseModel):
@@ -190,10 +189,12 @@ def perContractExposure(delta: float, spot: float) -> float:
 
 
 def _passesLiquidityFilter(snap) -> bool:
+    # Spread + positive mid only: deep-ITM LEAPS routinely have zero daily
+    # volume despite real open interest, so volume is not a usable signal here
     if snap.mid <= 0:
         return False
     relativeSpread = (snap.ask - snap.bid) / snap.mid
-    return relativeSpread <= MAX_REL_SPREAD and snap.volume >= MIN_DAILY_VOLUME
+    return relativeSpread <= MAX_REL_SPREAD
 
 
 def _pickCandidate(candidates) -> OptionSnapshot:

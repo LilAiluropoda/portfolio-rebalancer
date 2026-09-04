@@ -30,6 +30,12 @@ logger.setLevel(logging.DEBUG)
 logger.addHandler(logging.StreamHandler())
 
 
+def loadPortfolioCsv(filePath: Path) -> pl.DataFrame:
+    # Tolerate trailing empty fields (editor/copy artifacts); semantic errors
+    # are caught downstream by validation
+    return pl.read_csv(filePath, truncate_ragged_lines=True)
+
+
 def normalizePositions(positionDF: pl.DataFrame) -> pl.DataFrame:
     """
     Normalize the loaded CSV into the unified positions frame:
@@ -247,6 +253,8 @@ def enrichPositions(
         tbl_hide_dataframe_shape=True,
         tbl_column_data_type_inline=True,
         float_precision=2,
+        tbl_cols=50,
+        tbl_width_chars=300,
     )
 
     return positionEnrichedDF
@@ -279,7 +287,7 @@ def main():
     DATASOURCE = "yFinance"
     TRADING_PLATFORM = "futubullUS"
 
-    positionDF = pl.read_csv(FILEPATH)
+    positionDF = loadPortfolioCsv(FILEPATH)
     positionDF = normalizePositions(positionDF)
     designatedUnderlying = validateInputs(positionDF, args.leverage, args.liquidateLeaps)
     logger.info(f"[Data Loading] Loaded CSV with {len(positionDF)} records")

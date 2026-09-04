@@ -1,6 +1,6 @@
 import pytest
 
-from main import validateInputs
+from main import loadPortfolioCsv, validateInputs
 from market_data import OccParseError
 from conftest import cash as cashRow, equity as equityRow, frameWith
 from conftest import option as optionRow
@@ -9,6 +9,26 @@ from conftest import option as optionRow
 def buildFrame(rows, includeSleeveColumn=True):
     # Normalize only — these tests exercise validateInputs themselves.
     return frameWith(rows, validate=False, includeSleeveColumn=includeSleeveColumn)
+
+
+def test_loader_tolerates_trailing_empty_fields(tmp_path):
+    # Copy artifacts from the 7-column example leave orphan commas on 6-column rows
+    csvPath = tmp_path / "portfolio.csv"
+    csvPath.write_text(
+        "instrumentId,idType,instrumentType,shares,targetRatioPct,timestamp\n"
+        '"VOO","ticker","Equity",35,100,"2026-09-03"\n'
+        '"VOO270115C00450000","occ","LEAPS Call",1,,"2026-09-03",\n'
+        '"USD","name","Cash and Cash Equivalents",1000,0,"2026-09-03"\n'
+    )
+
+    from main import normalizePositions
+
+    frame = normalizePositions(loadPortfolioCsv(csvPath))
+
+    kinds = dict(zip(frame["instrumentId"].to_list(), frame["kind"].to_list()))
+    assert kinds["VOO270115C00450000"] == "option"
+    assert kinds["VOO"] == "equity"
+    assert kinds["USD"] == "cash"
 
 
 def test_mixed_csv_normalizes():

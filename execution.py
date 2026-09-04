@@ -37,7 +37,9 @@ def printTradeSummary(trades: list[Trade]) -> None:
         limit=None,
         tbl_hide_dataframe_shape=True,
         tbl_column_data_type_inline=True,
-        float_precision=2
+        float_precision=2,
+        tbl_cols=50,
+        tbl_width_chars=300,
     )
 
 
@@ -296,6 +298,8 @@ def printExposureReport(reportDF: pl.DataFrame, achievedLeverage: float, totalFe
         tbl_hide_dataframe_shape=True,
         tbl_column_data_type_inline=True,
         float_precision=2,
+        tbl_cols=50,
+        tbl_width_chars=300,
     )
 
 
@@ -341,4 +345,6 @@ def printEnrichedPostTradePositions(positionPostTradeDF: pl.DataFrame) -> None:
         tbl_hide_dataframe_shape=True,
         tbl_column_data_type_inline=True,
         float_precision=2,
+        tbl_cols=50,
+        tbl_width_chars=300,
     )

@@ -195,6 +195,7 @@ class OptionQuoteSource(ABC):
 ALPACA_DATA_BASE_URL = "https://data.alpaca.markets"
 _MAX_SNAPSHOT_SYMBOLS = 100
 _MAX_CHAIN_PAGES = 50
+_MAX_QUOTE_AGE_DAYS = 5
 
 
 class AlpacaOptionData(OptionQuoteSource):
@@ -313,9 +314,15 @@ class AlpacaOptionData(OptionQuoteSource):
         except (TypeError, ValueError):
             _logger.warning("Skipping %s: missing or unparseable quote timestamp (%r)", symbol, rawTs)
             return None
-        if quoteTimestamp.date() != datetime.now(timezone.utc).date():
+        # Age window, not same-day: the freshest available quote is the previous
+        # US session's close for anyone running outside US market hours.
+        quoteAge = datetime.now(timezone.utc) - quoteTimestamp
+        if quoteAge > timedelta(days=_MAX_QUOTE_AGE_DAYS) or quoteAge < timedelta(hours=-1):
             _logger.warning(
-                "Skipping %s: quote timestamp %s is not same-day", symbol, quote["t"]
+                "Skipping %s: quote timestamp %s is older than %s days",
+                symbol,
+                quote["t"],
+                _MAX_QUOTE_AGE_DAYS,
             )
             return None
 

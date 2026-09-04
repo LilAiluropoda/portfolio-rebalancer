@@ -421,12 +421,15 @@ def test_ladder_two_expiries_resize_anchored_on_earliest_row_delta():
 # --- Liquidity filter branches (R12) ---
 
 
-def test_zero_volume_candidate_fails_liquidity_filter_to_shares_fallback():
-    # Candidate passes spread and expiry-floor checks but volume = 0 -> filtered
+def test_zero_volume_candidate_still_qualifies():
+    # Deep-ITM LEAPS routinely carry zero daily volume with real open interest —
+    # volume is not a liquidity signal here; spread and mid are
     zeroVolume = makeSnapshot(
         occ("VOO", CHAIN_LATE_EXPIRY, 420.0), "VOO", 20.0, 0.86,
         CHAIN_LATE_EXPIRY, volume=0.0,
     )
+    assert _passesLiquidityFilter(zeroVolume) is True
+
     source = FakeOptionSource(chainSnapshots=[zeroVolume])
     trades = planFor(
         [
@@ -436,8 +439,8 @@ def test_zero_volume_candidate_fails_liquidity_filter_to_shares_fallback():
         ],
         source,
     )
-    assert all(t.quantityKind != "contract" for t in trades)
-    assert any(t.reason == "shares fallback: no qualifying contract" for t in trades)
+    assert any(t.quantityKind == "contract" for t in trades)
+    assert any(t.reason == "initiation" for t in trades)
 
 
 def test_passes_liquidity_filter_branches_direct():
@@ -448,11 +451,6 @@ def test_passes_liquidity_filter_branches_direct():
     assert (
         _passesLiquidityFilter(SimpleNamespace(mid=10.0, bid=9.5, ask=10.5, volume=100.0))
         is True
-    )
-    # Volume below the floor fails
-    assert (
-        _passesLiquidityFilter(SimpleNamespace(mid=10.0, bid=9.5, ask=10.5, volume=0.0))
-        is False
     )
     # Spread above the cap fails
     assert (
