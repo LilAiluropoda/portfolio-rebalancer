@@ -73,7 +73,7 @@ uv run python main.py --portfolioCSV data/portfolio_example_leaps.csv --leverage
 
 - The target total equity exposure is L × portfolio market value. The designated sleeve's underlying carries (weight + L − 1) × MV of that exposure; every other sleeve stays at its base weight.
 - Delivery is contracts-first: deep-in-the-money LEAPS calls (≈0.85 delta, ≥21 months to expiry) sized round-to-nearest per contract (~delta × 100 × spot exposure each), with a share residual absorbing the rounding difference.
-- When the held contract drops inside 12 months to expiry, it is rolled: sell the held contract, buy a replacement selected by rule (latest qualifying expiry, strike nearest 0.85 delta, spread/volume filters) — no prompts.
+- When the held contract drops inside 12 months to expiry, it is rolled: sell the held contract, buy a replacement selected by rule (latest qualifying expiry, strike nearest 0.85 delta, spread filters) — no prompts.
 - Fees are computed per trade row under the Futu HK US options/equity schedule and are paid from the cash residual; the exposure report shows achieved leverage, per-sleeve tracking error, and total fees each run.
 
 ## Example Screenshot
