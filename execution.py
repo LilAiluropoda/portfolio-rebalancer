@@ -28,6 +28,7 @@ def printTradeSummary(trades: list[Trade]) -> None:
             "cost": trade.transactionCost,
             "sharesChange": trade.sharesChange,
             "marketValueChange": trade.marketValueChange,
+            "exposureChange": trade.exposureChange,
             "reason": trade.reason,
         }
         for trade in trades if trade.instrumentType != CASH_TYPE
@@ -272,6 +273,17 @@ def buildExposureReport(
         (pl.col("currentExposure") + pl.col("exposureChange")).alias("achievedExposure"),
     ).with_columns(
         (pl.col("achievedExposure") - pl.col("targetExposure")).alias("trackingError"),
+    ).with_columns(
+        # Ratio = monetized-delta share of the whole portfolio's monetized delta,
+        # computed separately for achieved and target so they compare directly
+        pl.when(pl.col("achievedExposure").sum() != 0)
+        .then(pl.col("achievedExposure") / pl.col("achievedExposure").sum() * 100)
+        .otherwise(0.0)
+        .alias("achievedRatioPct"),
+        pl.when(pl.col("targetExposure").sum() != 0)
+        .then(pl.col("targetExposure") / pl.col("targetExposure").sum() * 100)
+        .otherwise(0.0)
+        .alias("targetRatioPct"),
     ).select([
         "underlying",
         "postShares",
@@ -279,7 +291,9 @@ def buildExposureReport(
         "currentExposure",
         "exposureChange",
         "achievedExposure",
+        "achievedRatioPct",
         "targetExposure",
+        "targetRatioPct",
         "trackingError",
         "isDesignated",
     ])
@@ -303,42 +317,22 @@ def printExposureReport(reportDF: pl.DataFrame, achievedLeverage: float, totalFe
     )
 
 
-def enrichPostTradePositions(positionPostTradeDF: pl.DataFrame):
-    # Compute total portfolio value
-    totalMarketValue = positionPostTradeDF["marketValue"].sum()
-
-    # Add current ratio
-    positionPostTradeDF = positionPostTradeDF.with_columns(
-        pl.when(pl.lit(totalMarketValue) != 0)
-        .then(pl.col("marketValue") / totalMarketValue * 100)
-        .otherwise(0.0)
-        .alias("expectedRatioPct")
-    )
-    positionPostTradeDF = positionPostTradeDF.with_columns(
-        ((pl.col("expectedRatioPct") - pl.col("targetRatioPct")).alias("ratioDiffPct")),
-    )
-    logger.info(f"[Trade Execution] Added columns: expectedRatioPct, ratioDiffPct")
-    printEnrichedPostTradePositions(positionPostTradeDF)
-    return positionPostTradeDF
-
-
-def printEnrichedPostTradePositions(positionPostTradeDF: pl.DataFrame) -> None:
+def printExpectedPositions(positionPostTradeDF: pl.DataFrame) -> None:
+    """Per-instrument holdings after trades. Exposure ratios live in the
+    exposure report, where a sleeve's shares + contracts combine correctly."""
     totalMarketValue = positionPostTradeDF["marketValue"].sum()
     logger.info(
         f"[Post Trade Analysis] Total market value after trades: "
         f"{totalMarketValue:.2f}"
     )
 
-    logger.info("[Post Trade Analysis] Expected portfolio after trades:")
+    logger.info("[Post Trade Analysis] Expected positions after trades:")
 
     positionPostTradeDF.select([
         "instrumentId",
         "instrumentType",
         "shares",
         "marketValue",
-        "targetRatioPct",
-        "expectedRatioPct",
-        "ratioDiffPct",
         "closingPrice",
     ]).sort("marketValue", descending=True).show(
         limit=None,

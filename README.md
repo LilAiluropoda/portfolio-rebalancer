@@ -11,7 +11,7 @@ This script automates the process of rebalancing a portfolio to ensure the portf
 2. Enriches the portfolio data by fetching pricing data for each instrument (equity via Yahoo Finance; option premium/delta via Alpaca snapshots when option rows are present — delta comes from Alpaca only, and runs abort when it is unavailable).
 3. Plans trades per underlying "sleeve": drift rebalancing for plain equity sleeves, and the LEAPS lifecycle (initiate / keep / resize / roll / liquidate) for the designated sleeve.
 4. Executes trades through a funding waterfall (contract sells → equity sells → contract buys → equity buys → cash residual) and calculates per-row transaction costs (Futu HK US fee schedule).
-5. Outputs the post-trade portfolio (market values and ratios) plus a per-underlying exposure report with achieved leverage, tracking error, and total fees.
+5. Outputs the expected post-trade positions plus a per-underlying exposure report: achieved vs target monetized-delta ratios (each sleeve's share of total portfolio delta), tracking error, achieved leverage, and total fees.
 
 ## Installation
 ### Prerequisites

@@ -9,8 +9,8 @@ from constants import KIND_CASH, KIND_EQUITY, KIND_OPTION, OPTION_MULTIPLIER
 from execution import (
     applyTrades,
     buildExposureReport,
-    enrichPostTradePositions,
     executeTrades,
+    printExpectedPositions,
     printExposureReport,
     printTradeSummary,
 )
@@ -328,7 +328,7 @@ def main():
         logger.info("[Trade Generation] No trades generated.")
 
     positionPostTradeDF = applyTrades(positionEnrichedDF, trades)
-    _ = enrichPostTradePositions(positionPostTradeDF)
+    printExpectedPositions(positionPostTradeDF)
 
     reportDF, achievedLeverage, totalFees = buildExposureReport(
         positionEnrichedDF, sleeveTable, trades

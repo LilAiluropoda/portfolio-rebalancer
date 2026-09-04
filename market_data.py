@@ -305,21 +305,21 @@ class AlpacaOptionData(OptionQuoteSource):
         quote = raw.get("latestQuote") or {}
         bid, ask = quote.get("bp"), quote.get("ap")
         if not bid or bid <= 0 or not ask or ask <= 0:
-            _logger.warning("Skipping %s: non-positive quote (bid=%s)", symbol, bid)
+            _logger.warning("[Option Data] Skipping %s: non-positive quote (bid=%s)", symbol, bid)
             return None
 
         rawTs = quote.get("t")
         try:
             quoteTimestamp = datetime.fromisoformat(str(rawTs).replace("Z", "+00:00"))
         except (TypeError, ValueError):
-            _logger.warning("Skipping %s: missing or unparseable quote timestamp (%r)", symbol, rawTs)
+            _logger.warning("[Option Data] Skipping %s: missing or unparseable quote timestamp (%r)", symbol, rawTs)
             return None
         # Age window, not same-day: the freshest available quote is the previous
         # US session's close for anyone running outside US market hours.
         quoteAge = datetime.now(timezone.utc) - quoteTimestamp
         if quoteAge > timedelta(days=_MAX_QUOTE_AGE_DAYS) or quoteAge < timedelta(hours=-1):
             _logger.warning(
-                "Skipping %s: quote timestamp %s is older than %s days",
+                "[Option Data] Skipping %s: quote timestamp %s is older than %s days",
                 symbol,
                 quote["t"],
                 _MAX_QUOTE_AGE_DAYS,
@@ -331,7 +331,7 @@ class AlpacaOptionData(OptionQuoteSource):
         delta = greeks.get("delta")
         if delta is None:
             _logger.warning(
-                "Skipping %s: greeks.delta is null (no fallback estimation)", symbol
+                "[Option Data] Skipping %s: greeks.delta is null (no fallback estimation)", symbol
             )
             return None
 
