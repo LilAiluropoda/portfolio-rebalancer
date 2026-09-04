@@ -410,7 +410,9 @@ def test_ladder_two_expiries_resize_anchored_on_earliest_row_delta():
     assert postContracts == desiredAnchor  # 5 — the sleeve-average rule would give 6
     shareTrades = [t for t in trades if t.instrumentId == "VOO" and t.quantityKind == "share"]
     shareChange = sum(t.sharesChange for t in shareTrades)
-    assert postContracts * anchorPerContract + shareChange * SPOT == pytest.approx(
+    # Share leg is a change from the 35 held shares: 34 required -> sell 1
+    assert shareChange == -1
+    assert postContracts * anchorPerContract + (35 + shareChange) * SPOT == pytest.approx(
         targetExposure, abs=SPOT
     )
     assert any(t.reason == "drift rebalance" for t in shareTrades)

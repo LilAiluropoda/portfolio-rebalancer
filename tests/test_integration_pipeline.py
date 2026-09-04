@@ -149,7 +149,7 @@ def test_mixed_end_to_end_fees_cash_and_leverage():
     assert contractBuy.sharesChange == 2  # AE2: 2 contracts = 119k exposure
     assert contractBuy.quantityKind == "contract"
     assert contractBuy.reason == "initiation"
-    assert bySymbol["VOO"].sharesChange == -20  # share residual absorbs -14010.5
+    assert bySymbol["VOO"].sharesChange == -50  # 2 contracts overshoot; sell ALL held shares
     assert bySymbol["VOO"].reason == "initiation share residual"
     assert bySymbol["URA"].sharesChange == -633  # drift rebalance to 45% of 99,990
 
@@ -158,7 +158,7 @@ def test_mixed_end_to_end_fees_cash_and_leverage():
         1.99 + 2 * 0.30 + 2 * 0.013 + 2 * 0.02 + 2 * 0.18 + 2 * 0.0003
     )
     # Equity sell fees: per-row minimums (0.99 commission floor, 1.00 platform floor)
-    assert bySymbol["VOO"].transactionCost == pytest.approx(0.99 + 1.00 + 20 * 0.003 + 0.01)
+    assert bySymbol["VOO"].transactionCost == pytest.approx(0.99 + 1.00 + 50 * 0.003 + 0.01)
 
     # Cash row = -(net premium + share flows) - fees, exactly
     totalFees = sum(t.transactionCost for t in trades[:-1])
@@ -171,14 +171,14 @@ def test_mixed_end_to_end_fees_cash_and_leverage():
 
     # R19: achieved leverage = Σ achieved exposure / pre-trade MV
     report, achievedLeverage, reportFees = buildExposureReport(enriched, sleeveTable, trades)
-    assert achievedLeverage == pytest.approx((140000 + 45000) / 99990)
+    assert achievedLeverage == pytest.approx((119000 + 45000) / 99990)
     assert reportFees == pytest.approx(totalFees)
 
     voo = {r["underlying"]: r for r in report.iter_rows(named=True)}["VOO"]
-    assert voo["postShares"] == 30
+    assert voo["postShares"] == 0
     assert voo["postContracts"] == 2
-    assert voo["achievedExposure"] == pytest.approx(140000)
-    assert voo["trackingError"] == pytest.approx(140000 - 104989.5)
+    assert voo["achievedExposure"] == pytest.approx(119000)
+    assert voo["trackingError"] == pytest.approx(119000 - 104989.5)
     assert voo["isDesignated"]
 
 

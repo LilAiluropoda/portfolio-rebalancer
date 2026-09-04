@@ -88,10 +88,12 @@ def sizeSleeve(
     contractChange = desiredContracts - int(heldContracts)
 
     residualExposure = targetExposure - desiredContracts * perContractExposure
-    desiredShareChange = residualExposure / spot
-    shareChange = _bestEffortInt(desiredShareChange, heldShares)
+    requiredShares = residualExposure / spot
+    # Share leg is a CHANGE from current holdings, not the total: the sleeve
+    # already holds `heldShares` whose exposure counts toward the target
+    shareChange = _bestEffortInt(requiredShares - heldShares, heldShares)
 
-    achievedExposure = desiredContracts * perContractExposure + shareChange * spot
+    achievedExposure = desiredContracts * perContractExposure + (heldShares + shareChange) * spot
     # Signed tracking error: positive = overshoot, negative = undershoot
     trackingErrorExposure = achievedExposure - targetExposure
     residualDirection = (

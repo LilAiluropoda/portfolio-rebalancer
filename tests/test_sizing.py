@@ -28,16 +28,19 @@ def test_ae2_pure_leaps_sleeve_clamped_at_zero_shares():
 
 
 def test_mixed_delivery_lands_on_target_with_held_shares():
+    # 1 contract (59.5k) + 20 required shares (14k) = 73.5k target; sleeve holds
+    # 35 shares, so the CHANGE is to sell 15 — holdings count toward the target
     plan = sizeSleeve(
-        targetExposure=105000.0,
+        targetExposure=73500.0,
         perContractExposure=PER_CONTRACT,
         heldContracts=0,
         heldShares=35,
         spot=700.0,
     )
-    assert plan.contractChange == 2
-    assert plan.shareChange == pytest.approx(-20.0)  # sell 20 shares, sleeve lands on 105k
+    assert plan.contractChange == 1
+    assert plan.shareChange == pytest.approx(-15.0)
     assert plan.trackingErrorExposure == pytest.approx(0.0)
+    assert plan.residualDirection == "on-target"
 
 
 def test_share_sell_never_exceeds_holdings():
@@ -49,9 +52,9 @@ def test_share_sell_never_exceeds_holdings():
         spot=700.0,
     )
     assert plan.contractChange == 2
-    assert plan.shareChange == -5  # clamped: only 5 held
-    # sleeve = 119k - 5*700 = 115.5k vs 105k target -> +10.5k error
-    assert plan.trackingErrorExposure == pytest.approx(10500.0)
+    assert plan.shareChange == -5  # clamped: only 5 held, all sold
+    # sleeve = 119k contracts + 0 shares vs 105k target -> +14k error
+    assert plan.trackingErrorExposure == pytest.approx(14000.0)
     assert plan.residualDirection == "overshoot"
 
 
@@ -65,9 +68,10 @@ def test_resize_on_leverage_cut_sells_to_nearest():
         spot=700.0,
     )
     assert plan.contractChange == -1
-    assert plan.shareChange == 7  # int(5500/700) = 7 buys
-    assert plan.trackingErrorExposure == pytest.approx(-600.0)  # achieved 64.4k vs 65k target
-    assert plan.residualDirection == "undershoot"
+    # required 7.86 shares (5.5k residual) vs 10 held -> sell 2
+    assert plan.shareChange == -2
+    assert plan.trackingErrorExposure == pytest.approx(100.0)  # achieved 65.1k vs 65k
+    assert plan.residualDirection == "overshoot"
 
 
 def test_rounding_boundary_half_rounds_up():
